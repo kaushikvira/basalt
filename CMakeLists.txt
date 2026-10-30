@@ -441,7 +441,7 @@ endif()
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
-add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunked.cu
+add_library(prefill STATIC src/prefill/gemm.cu src/prefill/gemm_plans.cpp src/prefill/kernels.cu src/prefill/gdn_chunked.cu
   src/prefill/lifecycle.cpp
   src/prefill/layout.cpp
   src/prefill/projection.cpp
