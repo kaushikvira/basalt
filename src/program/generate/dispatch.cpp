@@ -40,6 +40,7 @@ int dispatch(Context& context) {
     auto& kv_host_forced = *context.kv_host_forced;
     auto& kv_tail_copies = *context.kv_tail_copies;
     auto& copies_from = *context.copies_from;
+    auto& lend_from = *context.lend_from;
     auto& bslot_ss = *context.bslot_ss;
     auto& slot_cap = *context.slot_cap;
     auto& slot_kv_cuda0 = *context.slot_kv_cuda0;
@@ -168,7 +169,7 @@ int dispatch(Context& context) {
             .kv_host_on = kv_host_on,
             .kv_host_forced = kv_host_forced,
             .kv_tail_copies = kv_tail_copies,
-            .lend_from = *context.lend_from,
+            .lend_from = lend_from,
             .copies_from = copies_from,
             .bslot_ss = bslot_ss,
             .slot_cap = slot_cap,
