@@ -42,6 +42,7 @@ the engine is idle; its next turn reads it back. The startup line and each move 
 `slot N's idle conversation ...`). The cache never goes below the slots a prompt chunk needs: a request whose KV would
 take it there even after the other sessions and idle conversations give back what they can is refused with that error,
 and a reply that grows past it ends with it (a `--parallel` slot ends as at its length limit); the engine keeps running.
+A deep request keeps its K/V in pinned RAM instead when the RAM holds it ([elastic KV](elastic-kv.md)).
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
