@@ -14,6 +14,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(BUILD_TESTING "Build the tests and parity programs" OFF)
+# Covers the project's own C++ and CUDA sources only; off by default so a newer compiler's new warning cannot break a user build.
 option(WERROR "Treat compiler warnings as errors" OFF)
 if(BUILD_TESTING)
   enable_testing()
@@ -668,6 +669,11 @@ basalt_embed_manifest(community_row_test)
 basalt_cpu_test(NAME community_row_test COMMAND community_row_test)
 set_tests_properties(community_row_test PROPERTIES TIMEOUT 60)
 if(Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME generate_prompt_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/generate_prompt_test.py
+                          --engine $<TARGET_FILE:basalt>
+                          --model ${CMAKE_CURRENT_SOURCE_DIR}/models/Qwen3.8-FN-NVFP4.basalt)
+  set_tests_properties(generate_prompt_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   basalt_cpu_test(NAME community_row_fix_test
                   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/community_row_fix_test.py
                           $<TARGET_FILE:community_row_test> ${CMAKE_CURRENT_SOURCE_DIR})
@@ -857,6 +863,7 @@ add_executable(sampler_parity tests/kernels/sampler_parity.cpp)
 target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
+basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
 # the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/kernels/decode_cluster_parity.cpp)

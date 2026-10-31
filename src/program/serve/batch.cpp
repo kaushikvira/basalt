@@ -3,6 +3,19 @@
 
 namespace basalt::program::serve {
 
+namespace {
+// stable insertion sort for the few slots a window holds
+template <class Less>
+void sort_small(int* v, int n, Less less) {
+    for (int i = 1; i < n; ++i) {
+        const int x = v[i];
+        int j = i;
+        for (; j > 0 && less(x, v[j - 1]); --j) v[j] = v[j - 1];
+        v[j] = x;
+    }
+}
+}  // namespace
+
 uint64_t Runtime::row_hash(int t) {
     lh_buf.resize((size_t) n_vocab);
     if (!ver.copy_logits(t, lh_buf.data())) return 0;
@@ -98,7 +111,7 @@ bool Runtime::batch_step() {
             // want less: the slots wanting least are served in full, the rest split what is left
             int ord[MR];
             for (int sg = 0; sg < S; ++sg) ord[sg] = sg;
-            std::sort(ord, ord + S, [&](int x1, int x2) { return Tw[x1] < Tw[x2]; });
+            sort_small(ord, S, [&](int x1, int x2) { return Tw[x1] < Tw[x2]; });
             int left_rows = MB;
             for (int i = 0; i < S; ++i) {
                 const int share = std::max(1, (left_rows + (S - i) - 1) / (S - i));
@@ -191,8 +204,10 @@ bool Runtime::batch_step() {
                     acted = true;
                 }
             } else if (ba_win % o.adapt_every == 0) {
+                const int64_t np0 = xq_noplace;
                 ok = xq_round();
                 ba_swaps += (int64_t) xq.size();
+                ba_noplace += xq_noplace - np0;
                 ++ba_rounds;
                 acted = true;
             }
@@ -331,7 +346,7 @@ bool Runtime::batch_step() {
         int cont[MR], nc = 0;
         for (int sg = 0; sg < S; ++sg) if (fin_of[sg] == nullptr) cont[nc++] = sg;
         int nfull = std::min(nc, MR - nc);
-        std::sort(cont, cont + nc, [&](int x1, int x2) {
+        sort_small(cont, nc, [&](int x1, int x2) {
             const BSlot& s1 = bs[(size_t) rows[x1]];
             const BSlot& s2 = bs[(size_t) rows[x2]];
             return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
@@ -391,11 +406,13 @@ bool Runtime::batch_step() {
                      (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                      (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
         if (batch_adapt) {
-            basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %.3f ms/window of host "
-                                 "time, peer swaps total %lld", (long long) ba_rounds, (long long) ba_swaps,
-                         ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0, ba_ms / w,
+            basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %lld deferred "
+                                 "(no free RAM place), %.3f ms/window of host time, peer swaps total %lld",
+                         (long long) ba_rounds, (long long) ba_swaps,
+                         ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0,
+                         (long long) ba_noplace, ba_ms / w,
                          (long long) (peer.valid() ? peer.swaps() : 0));
-            ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = 0;
+            ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = ba_noplace = 0;
             ba_ms = 0;
         }
         if (bt_slotwin > 0)
@@ -440,6 +457,7 @@ int Runtime::init_batch() {
     ba_rounds_l = 0;
     ba_h_l = 0;
     ba_m_l = 0;
+    ba_noplace = 0;
     ba_ms = 0;
     ba_job = false;
     // timing of the batch windows since the slots were last all idle (one stderr line then)
