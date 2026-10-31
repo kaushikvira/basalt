@@ -3,6 +3,7 @@
 
 #include "../engine_local.hpp"
 #include "basalt/program/grammar/guard.hpp"
+#include "basalt/platform/system.hpp"
 
 #include <array>
 #include <functional>
@@ -26,8 +27,12 @@ namespace serve {
 inline constexpr int64_t kKvHostSlotCells = 32768;
 
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
-// the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
+// a driver that pages GPU memory do so, and a verify graph spinning on a host flag then never finishes.  A driver that
+// fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
+// a streaming state's residency map).
 inline constexpr int kVramStallMib = 256;
+inline constexpr int kVramFloorMib = 128;
+inline int vram_floor_mib() { return basalt::platform::gpu_memory_pages() ? kVramStallMib : kVramFloorMib; }
 
 // All engine objects belong to startup and outlive run(). Callbacks borrow the same objects.
 struct Context {

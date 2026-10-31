@@ -118,6 +118,7 @@ Flow Request::complete() {
             BSlot& sl = runtime_.bs[(size_t) runtime_.admit_slot];
             sl = BSlot{};
             sl.active = true;
+            sl.pen_n = req_sp.penalty_last_n;
             sl.script = std::move(runtime_.bscript[(size_t) runtime_.admit_slot].first);
             sl.rng.seed(runtime_.bscript[(size_t) runtime_.admit_slot].second);
             runtime_.bscript[(size_t) runtime_.admit_slot].first.clear();
@@ -167,6 +168,7 @@ Flow Request::complete() {
             sb.cvec = runtime_.cvec_cached;
             sb.imgs = runtime_.live_imgs;
             sb.cached = runtime_.live_ok && runtime_.o.prompt_cache > 0;
+            sb.idle_busy = runtime_.busy_now();
             if (sb.cached) sb.checks = std::move(runtime_.checks);
             if (sb.cached && runtime_.batch_spec && !runtime_.mtp.copy_store(runtime_.mtp.main_store(), slot_b, (int64_t) runtime_.live.size(), runtime_.err)) {
                 runtime_.err.clear();
@@ -182,6 +184,7 @@ Flow Request::complete() {
         runtime_.rsp = &runtime_.ss;
         runtime_.sp.set_session(runtime_.ss);
         if (runtime_.mtp_on) runtime_.mtp.set_ple_session(&runtime_.ss);
+        runtime_.solo_out = nullptr;
         runtime_.live = std::move(solo_book.live);
         runtime_.live_imgs = std::move(solo_book.live_imgs);
         runtime_.live_ok = solo_book.live_ok;
@@ -193,6 +196,9 @@ Flow Request::complete() {
             runtime_.live_ok = false;
             runtime_.checks.clear();
         }
+        runtime_.solo_draft_back(!solo_moved);
+    } else {
+        runtime_.solo_idle_busy = runtime_.busy_now();
     }
     if (runtime_.drive.routing != nullptr) std::fflush(runtime_.drive.routing);   // the routing trace survives a crash and is watchable mid-session
 
