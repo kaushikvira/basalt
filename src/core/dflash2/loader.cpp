@@ -223,8 +223,8 @@ void DFlash2Drafter::resolve(const DFlash2Tensor& t) {
 
 // ================================ the VRAM ================================
 
-uint64_t DFlash2Drafter::activations_bytes(const DFlash2Geometry& g) {
-    const uint64_t B = (uint64_t) g.block_size;
+uint64_t DFlash2Drafter::activations_bytes(const DFlash2Geometry& g, int W) {
+    const uint64_t B = (uint64_t) W;
     const uint64_t h = (uint64_t) g.hidden_size;
     const uint64_t q = (uint64_t) g.q_width();
     const uint64_t kv = (uint64_t) g.kv_width();
@@ -256,7 +256,7 @@ bool DFlash2Drafter::plan_bytes(const DFlash2Files& files, const DFlash2Geometry
     if (files.dense.empty() || !files.dense.exists()) { err = "dflash2: cannot read " + files.dense.path; return false; }
     const uint64_t dense = files.dense.size();
     const uint64_t kv = g.kv_bytes(g.sliding_window);
-    const uint64_t act = activations_bytes(g);
+    const uint64_t act = activations_bytes(g, g.block_size);
     out = dense + kv + act;
     return true;
 }
@@ -317,7 +317,7 @@ bool DFlash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const f
         kv_v_[(size_t) i] = kv_k_[(size_t) i] + (size_t) layer_elems;
     }
     // ---- the block's working buffers
-    arena_bytes_ = activations_bytes(g_);
+    arena_bytes_ = activations_bytes(g_, draft_k_ > 0 ? draft_k_ + 1 : g_.block_size);
     if (cudaMalloc(&arena_, arena_bytes_) != cudaSuccess) { err = "dflash2: the working buffers do not fit in VRAM"; return false; }
     cudaMemset(arena_, 0, arena_bytes_);
     // ---- the stream and the done event

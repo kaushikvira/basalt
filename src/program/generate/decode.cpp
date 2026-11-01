@@ -253,8 +253,8 @@ int decode(Context& context) {
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
             }
             if (first_window) T = 1;
-            // the DFlash2 block is 8 tokens (anchor + 7 drafts); the window cannot exceed it (the drafter's K = 7)
-            if (use_dflash2) T = std::min(T, 8);
+            // the DFlash2 block is the anchor + the drafts (the drafter's width); the window cannot exceed it
+            if (use_dflash2) T = std::min(T, dflash2.draft_width());
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -372,7 +372,7 @@ int decode(Context& context) {
                 const Clock::time_point td0 = df2prof.on ? Clock::now() : Clock::time_point{};
                 // the next window's width is at most the spec's (the suffix lookup widens it past S_mtp); the graph
                 // always drafts the block's K, the window takes what it verifies
-                if (!dflash2.draft(std::min(o.spec, 8), outv.data(), p, a, drafts.data(), err, dprob.data())) {
+                if (!dflash2.draft(std::min(o.spec, dflash2.draft_width()), outv.data(), p, a, drafts.data(), err, dprob.data())) {
                     basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
                     return 1;
                 }

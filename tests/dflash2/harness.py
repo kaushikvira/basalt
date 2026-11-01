@@ -21,7 +21,7 @@ Usage:
 import argparse, json, os, re, subprocess, tempfile
 
 
-def run_bench(binp, model, gpu, spec, seed, max_new, dlog, dflash2=False):
+def run_bench(binp, model, gpu, spec, seed, max_new, dlog, dflash2=False, extra=None):
     # --gpu 1 is MANDATORY: basalt-bench defaults to GPU 0 (the 5090), which is FORBIDDEN.
     # --engine: the worktree bench's compile-time stamp is a container path (/src/bin/basalt),
     # so name the engine binary beside the bench explicitly.
@@ -31,6 +31,8 @@ def run_bench(binp, model, gpu, spec, seed, max_new, dlog, dflash2=False):
     passthrough = ["--spec", str(spec), "--greedy", "--max-new", str(max_new), "--draft-log", dlog]
     if dflash2:
         passthrough.append("--dflash2")
+    if extra:
+        passthrough.extend(extra)
     cmd = [binp, "--model", model, "--gpu", gpu, "-t", "conv,struct,prose",
            "--seed", str(seed), "--engine", engine, "--fixtures", fixtures, "--", *passthrough]
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -92,12 +94,21 @@ def main():
     ap.add_argument("--bin", default=os.path.expanduser("~/work/basalt/bin/basalt-bench"))
     ap.add_argument("--gpu", default="1", help="GPU index; MUST be 1 (a5000). GPU 0 is forbidden.")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--dflash2-k", type=int, default=0, help="dflash2 drafts per round (0 = default 7)")
+    ap.add_argument("--dflash2-window", type=int, default=0, help="dflash2 sliding window (0 = pack's 2048)")
     a = ap.parse_args()
     spec = 0 if a.drafter == "none" else a.spec
+    extra = []
+    if a.drafter == "dflash2":
+        if a.dflash2_k > 0:
+            extra += ["--dflash2-k", str(a.dflash2_k)]
+        if a.dflash2_window > 0:
+            extra += ["--dflash2-window", str(a.dflash2_window)]
     with tempfile.TemporaryDirectory() as td:
         dlog = os.path.join(td, "draft.log")
-        r = run_bench(a.bin, a.model, a.gpu, spec, a.seed, a.max_new, dlog, dflash2=(a.drafter == "dflash2"))
+        r = run_bench(a.bin, a.model, a.gpu, spec, a.seed, a.max_new, dlog, dflash2=(a.drafter == "dflash2"), extra=extra)
         res = {"model": a.model, "drafter": a.drafter, "spec": spec, "seed": a.seed,
+               "dflash2_k": a.dflash2_k, "dflash2_window": a.dflash2_window,
                "max_new": a.max_new, "exit_code": r.returncode,
                "fixtures": parse_table(r.stdout),
                "decode_tps": parse_tps(r.stdout), "draft": parse_draft_log(dlog),

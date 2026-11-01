@@ -59,7 +59,7 @@ bool DFlash2Drafter::prewarm(std::string& err) {
         return false;
     }
     const DFlash2Geometry& g = g_;
-    const int W = g.block_size, K = W - 1, H = g.hidden_size, Q = g.q_width(), KV = g.kv_width();
+    const int W = draft_width(), K = W - 1, H = g.hidden_size, Q = g.q_width(), KV = g.kv_width();
     const int I = g.intermediate_size, G = H / g.conv_group_size, R = g.selector_rank, V = g.vocab_size;
     const int ntap = (int) g.target_layer_ids.size();
     const int chunks = (V + 1023) / 1024;
@@ -247,7 +247,7 @@ bool DFlash2Drafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32
         return false;
     }
     const DFlash2Geometry& g = g_;
-    const int W = g.block_size, K = W - 1;
+    const int W = draft_width(), K = W - 1;
     if (T < 2 || T - 1 > K) {
         err = "dflash2: the window T-1 exceeds the block's K";
         return false;

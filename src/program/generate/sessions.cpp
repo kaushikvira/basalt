@@ -378,6 +378,18 @@ int sessions(Context& context) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
+        // the runtime overrides: the drafts per round (the block's width) and the sliding window (the K/V arena)
+        if (!o.dflash2_src.empty()) {
+            if (o.dflash2_k > 0 && o.spec < o.dflash2_k + 1) {
+                basalt::log::error("basalt generate", "--dflash2-k %d needs --spec %d or more", o.dflash2_k, o.dflash2_k + 1);
+                return 1;
+            }
+            if (o.dflash2_k > 0 && !dflash2.set_drafts(o.dflash2_k, err) ||
+                o.dflash2_window > 0 && !dflash2.set_window(o.dflash2_window, err)) {
+                basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
+                return 1;
+            }
+        }
     }
     const bool dflash2_on = !o.dflash2_src.empty();
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so

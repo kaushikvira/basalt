@@ -228,7 +228,7 @@ Flow Request::read_prompt() {
     if (runtime_.dflash2_on && dflash2_pf_tap_) {
         const size_t nt = runtime_.dflash2.geom().target_layer_ids.size();
         const int64_t n_ids = dflash2_pf_tap_n_;
-        const int64_t tap_n = std::min<int64_t>(2048, n_ids);
+        const int64_t tap_n = std::min<int64_t>(runtime_.dflash2.geom().sliding_window, n_ids);
         std::vector<float> feats((size_t) tap_n * nt * (size_t) runtime_.g.n_embd);
         if (cudaMemcpy(feats.data(), dflash2_pf_tap_ + (size_t) (n_ids - tap_n) * nt * (size_t) runtime_.g.n_embd,
                        (size_t) tap_n * nt * (size_t) runtime_.g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {

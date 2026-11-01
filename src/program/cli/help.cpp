@@ -45,6 +45,8 @@ void usage() {
                  "  --dflash2            enable the DFlash2 block-diffusion drafter (needs the pack's dflash2 section);\n"
                  "                       it replaces the MTP drafter (the two are mutually exclusive); greedy drafts,\n"
                  "                       verified by the same window\n"
+                 "  --dflash2-k N        the DFlash2 drafts per round (1..8, default 7; the window needs --spec N+1+)\n"
+                 "  --dflash2-window N   the DFlash2 drafter's sliding window (a power of two <= the pack's; default 2048)\n"
                  "  --stop-eos           stop when the model emits an end-of-turn token\n"
                  "  --eos-ids LIST       the end-of-turn token ids for --stop-eos (default 248044,248046); implies it\n"
                  "  --prompt-cache-root N  --serve: checkpoint a prompt's first turn boundary when it is at least N tokens\n"

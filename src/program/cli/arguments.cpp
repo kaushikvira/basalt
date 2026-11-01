@@ -114,6 +114,8 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--dflash2") o.dflash2 = true;
+        else if (a == "--dflash2-k") o.dflash2_k = std::atoi(next("--dflash2-k"));
+        else if (a == "--dflash2-window") o.dflash2_window = std::atoi(next("--dflash2-window"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));

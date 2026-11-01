@@ -182,6 +182,10 @@ struct Options {
     /// The DFlash2 drafter's files, when --dflash2 is on and the pack has the dflash2 section (the model path);
     /// empty means no DFlash2 drafter.
     std::string dflash2_src;
+    /// --dflash2-k N: the DFlash2 drafts per round (1..8; 0 = the checkpoint block's, 7).  Needs --spec N+1 or more.
+    int dflash2_k = 0;
+    /// --dflash2-window N: the DFlash2 drafter's sliding window (a power of two, not above the pack's; 0 = the pack's).
+    int dflash2_window = 0;
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
     /// CPU computes the rest (host-planned verify windows).  Set from the startup link probe.
     double pcie_frac = -1.0;

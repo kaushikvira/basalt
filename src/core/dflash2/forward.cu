@@ -300,7 +300,8 @@ __global__ void __launch_bounds__(NTHREADS) gemm_q8_kernel(const uint8_t* __rest
 /// C [N, M] = head [M, K] Q8_0 @ x [N, K], N <= 16.
 void gemm_q8(const uint8_t* w, const bf16* x, bf16* c, int M, int K, int N, cudaStream_t s) {
     const dim3 grid(M);
-    gemm_q8_kernel<7, 256, 2560><<<grid, 256, 0, s>>>(w, x, c, M, K);
+    if (N <= 7) gemm_q8_kernel<7, 256, 2560><<<grid, 256, 0, s>>>(w, x, c, M, K);
+    else gemm_q8_kernel<8, 256, 2560><<<grid, 256, 0, s>>>(w, x, c, M, K);
 }
 
 // ================================ the elementwise ops ================================

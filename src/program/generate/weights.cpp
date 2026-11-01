@@ -42,6 +42,9 @@ int weights(Context& context) {
         std::string dflash2_err;
         const bool dflash2_planned = !o.dflash2 ||
             (basalt::core::DFlash2Geometry::from_meta(model_file.meta(), dflash2_geom, dflash2_err) &&
+             // the runtime overrides, applied to the plan (the arena's width, the K/V arena's cells)
+             (o.dflash2_k > 0 ? (dflash2_geom.block_size = o.dflash2_k + 1, true) : true) &&
+             (o.dflash2_window > 0 ? (dflash2_geom.sliding_window = o.dflash2_window, true) : true) &&
              basalt::core::DFlash2Drafter::plan_bytes(basalt::core::DFlash2Files::from(srcs), dflash2_geom,
                                                       dflash2_bytes, dflash2_err));
         const bool planned =

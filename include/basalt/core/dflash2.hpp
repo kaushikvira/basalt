@@ -169,6 +169,29 @@ public:
     /// The parsed geometry (after load).
     const DFlash2Geometry& geom() const { return g_; }
 
+    /// The draft block's width in tokens (the anchor + the drafts): `block_size` until `set_drafts` says otherwise.
+    int draft_width() const { return draft_k_ > 0 ? draft_k_ + 1 : g_.block_size; }
+
+    /// Draft `k` tokens per round (the block runs at width k+1; the graph captures at that width in prewarm).
+    /// Before `prewarm`; k in 1..8 (the verify window's cap).
+    bool set_drafts(int k, std::string& err) {
+        if (k < 1 || k > 8) { err = "dflash2: the draft count is 1..8"; return false; }
+        draft_k_ = k;
+        return true;
+    }
+
+    /// The local cyclic K/V's sliding window (the SWA's visible prefix), overriding the pack's.  A power of two
+    /// not above the pack's window (the checkpoints' 2048).  Before `bind` (the K/V arena is carved to it).
+    bool set_window(int w, std::string& err) {
+        if (w <= 0 || (w & (w - 1)) != 0) { err = "dflash2: the window is a power of two"; return false; }
+        if (g_.sliding_window > 0 && w > g_.sliding_window) {
+            err = "dflash2: the window exceeds the pack's " + std::to_string(g_.sliding_window);
+            return false;
+        }
+        g_.sliding_window = w;
+        return true;
+    }
+
     uint64_t vram_bytes() const { return vram_; }
     int device() const { return device_; }
     const DFlash2Geometry& geometry() const { return g_; }
@@ -180,12 +203,13 @@ private:
     /// The index line's tensor, copied into the role of the internal layout it names (an unrecognized name is
     /// ignored; `load` then reports any role the index left empty).
     void resolve(const DFlash2Tensor& t);
-    /// The working-buffer bytes for one block of `g.block_size` tokens through the layers + selector.
-    static uint64_t activations_bytes(const DFlash2Geometry& g);
+    /// The working-buffer bytes for one block of `W` tokens through the layers + selector.
+    static uint64_t activations_bytes(const DFlash2Geometry& g, int W);
 
     DFlash2Geometry g_;
     DFlash2Files files_;
     DFlash2Weights w_;
+    int draft_k_ = 0;                ///< the drafts per round (0 = the block's own: block_size - 1)
     std::vector<DFlash2Tensor> tensors_;   ///< the index, in pool order
     int resolved_count_ = 0;               ///< S3: the tensors resolve() claimed (== tensors_.size() after load)
     const WeightTable* wt_ = nullptr;      ///< S2: the target's weight table (embedding + head)

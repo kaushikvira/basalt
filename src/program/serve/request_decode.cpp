@@ -126,6 +126,8 @@ Flow Request::decode() {
         }
         const bool timed_round = !first_window;
         const Clock::time_point round0 = Clock::now();
+        // the DFlash2 block is the anchor + the drafts (the drafter's width); the window cannot exceed it
+        if (runtime_.dflash2_on) T = std::min(T, runtime_.dflash2.draft_width());
         if (p + T > runtime_.o.max_context) break;
         window[0] = x;
         for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
@@ -581,8 +583,8 @@ Flow Request::decode() {
                 std::printf("ERR dflash2: %s\n", runtime_.err.c_str());
                 return Flow::error;
             }
-            drafted = runtime_.dflash2.draft(std::min(runtime_.S, 8), outv.data(), p, a, drafts.data(),
-                                             runtime_.err, dprob.data());
+            drafted = runtime_.dflash2.draft(std::min(runtime_.S, runtime_.dflash2.draft_width()), outv.data(), p, a,
+                                             drafts.data(), runtime_.err, dprob.data());
             if (!drafted) {
                 std::printf("ERR dflash2: %s\n", runtime_.err.c_str());
                 return Flow::error;
