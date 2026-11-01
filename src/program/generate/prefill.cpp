@@ -102,6 +102,11 @@ int prefill(Context& context) {
             if (!dflash2.bind(wt, &native_head, nullptr, err)) {
                 return fatal_start_error(err);
             }
+            // prewarm before the prompt tail's append_context: the append's workspace (ctx_x, ctx_pos) is carved in
+            // prewarm, and the decode loop's prewarm would run after the tail append (not idempotent - one prewarm)
+            if (!dflash2.prewarm(err)) {
+                return fatal_start_error("dflash2: " + err);
+            }
             if (n_batched > 0) {
                 const auto& dg = dflash2.geom();
                 const int nt = (int) dg.target_layer_ids.size();

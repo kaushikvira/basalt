@@ -87,6 +87,14 @@ bool DFlash2Drafter::prewarm(std::string& err) {
     wk_.ctx_k = (uint16_t*) cv.take(512u * (uint64_t) KV * B2);
     wk_.ctx_v = (uint16_t*) cv.take(512u * (uint64_t) KV * B2);
     wk_.ctx_x = (uint16_t*) cv.take(512u * (uint64_t) ntap * (uint64_t) H * B2);
+    // the named takes must fit the budgeted arena (a wrap of cv.left is silent; check the signed sum)
+    {
+        int64_t used = (int64_t) (arena_bytes_ - cv.left);
+        if (used > (int64_t) arena_bytes_) {
+            err = "dflash2: the working arena is under-budgeted (activations_bytes)";
+            return false;
+        }
+    }
     wk_.logits = (uint16_t*) cv.take((uint64_t) K * (uint64_t) V * B2);
     wk_.hidden_full = (uint16_t*) cv.take((uint64_t) K * (uint64_t) H * B2);
     wk_.hidden_r = (uint16_t*) cv.take((uint64_t) K * (uint64_t) R * B2);
@@ -245,7 +253,9 @@ bool DFlash2Drafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32
         return false;
     }
     if (a < 0 || a >= T) {
-        err = "dflash2: the accepted count is out of the window";
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "dflash2: the accepted count is out of the window (T=%d a=%d p=%lld)", T, a, (long long) p);
+        err = buf;
         return false;
     }
     if (frontier_pos_ < p + a) {
@@ -322,13 +332,19 @@ bool DFlash2Drafter::append_context(const float* features, int n, int64_t pos0, 
         for (int i = 0; i < nn * ntap * H; ++i) xh[(size_t) i] = to_bf16(features[(size_t) i]);
         if (cudaMemcpyAsync(wk_.ctx_x, xh.data(), (size_t) nn * ntap * H * 2, cudaMemcpyHostToDevice, cs_) !=
             cudaSuccess) {
-            err = "dflash2: the features upload";
+            char buf[256];
+            int dev = -1;
+            cudaGetDevice(&dev);
+            std::snprintf(buf, sizeof buf, "dflash2: the features upload: %s (ctx_x=%p arena=%p bytes=%llu nn=%d dev=%d)",
+                          cudaGetErrorString(cudaGetLastError()), (void*) wk_.ctx_x, (void*) arena_,
+                          (unsigned long long) arena_bytes_, nn, dev);
+            err = buf;
             return false;
         }
         int pos_h[512];
         for (int i = 0; i < nn; ++i) pos_h[i] = (int) (pos0 + c0 + i);
         if (cudaMemcpyAsync(wk_.ctx_pos, pos_h, (size_t) nn * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
-            err = "dflash2: the positions upload";
+            err = std::string("dflash2: the positions upload: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         fk::gemm_bf16_wide(fc, cb16(wk_.ctx_x), b16(wk_.ctx), H, ntap * H, nn, cs_);

@@ -21,11 +21,18 @@ Usage:
 import argparse, json, os, re, subprocess, tempfile
 
 
-def run_bench(binp, model, gpu, spec, seed, max_new, dlog):
+def run_bench(binp, model, gpu, spec, seed, max_new, dlog, dflash2=False):
     # --gpu 1 is MANDATORY: basalt-bench defaults to GPU 0 (the 5090), which is FORBIDDEN.
+    # --engine: the worktree bench's compile-time stamp is a container path (/src/bin/basalt),
+    # so name the engine binary beside the bench explicitly.
+    engine = os.path.join(os.path.dirname(os.path.abspath(binp)), "basalt")
+    # the worktree bench's fixture stamp is also a container path (/src/data/bench); name the repo's fixtures
+    fixtures = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(binp))), "data", "bench")
+    passthrough = ["--spec", str(spec), "--greedy", "--max-new", str(max_new), "--draft-log", dlog]
+    if dflash2:
+        passthrough.append("--dflash2")
     cmd = [binp, "--model", model, "--gpu", gpu, "-t", "conv,struct,prose",
-           "--seed", str(seed), "--", "--spec", str(spec), "--greedy",
-           "--max-new", str(max_new), "--draft-log", dlog]
+           "--seed", str(seed), "--engine", engine, "--fixtures", fixtures, "--", *passthrough]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -77,7 +84,7 @@ def parse_tps(stdout):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", "--pack", required=True, dest="model")
     ap.add_argument("--drafter", default="mtp", choices=["mtp", "dflash2", "none"])
     ap.add_argument("--spec", type=int, default=8)
     ap.add_argument("--max-new", type=int, default=512)
@@ -89,7 +96,7 @@ def main():
     spec = 0 if a.drafter == "none" else a.spec
     with tempfile.TemporaryDirectory() as td:
         dlog = os.path.join(td, "draft.log")
-        r = run_bench(a.bin, a.model, a.gpu, spec, a.seed, a.max_new, dlog)
+        r = run_bench(a.bin, a.model, a.gpu, spec, a.seed, a.max_new, dlog, dflash2=(a.drafter == "dflash2"))
         res = {"model": a.model, "drafter": a.drafter, "spec": spec, "seed": a.seed,
                "max_new": a.max_new, "exit_code": r.returncode,
                "fixtures": parse_table(r.stdout),

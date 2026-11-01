@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/diag.hpp"
 
 namespace basalt::program::generate {
 
@@ -94,7 +95,8 @@ int decode(Context& context) {
             // hyper-connection mix (the target's hidden state) for its rows, which the loop feeds to append_context.
             const auto& dg = dflash2.geom();
             const int nt = (int) dg.target_layer_ids.size();
-            if (cudaMalloc(&dflash2_tap_buf, (size_t) o.spec * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+            // the window's T rows (the anchor + up to spec-1 accepted) plus the readback's one-row skip: spec + 1
+            if (cudaMalloc(&dflash2_tap_buf, (size_t) (o.spec + 1) * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
                 basalt::log::error("basalt generate", "the DFlash2 tap buffer failed");
                 return 1;
             }
@@ -213,6 +215,10 @@ int decode(Context& context) {
         // first cell)
         bool first_window = true;
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
+        // --draft-log FILE: one line per window (T, accepted, from-suffix), for draft-policy study (the serve
+        // path's W lines; the harness parses the first two fields)
+        static FILE* const draft_log = basalt::core::diagnostics().draft_log.empty() ? nullptr
+            : std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
@@ -221,10 +227,7 @@ int decode(Context& context) {
             basalt::log::error("basalt", "mtp: capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
-        if (use_dflash2 && !dflash2.prewarm(err)) {
-            basalt::log::error("basalt", "dflash2: capturing the draft graph failed: %s", err.c_str());
-            return 1;
-        }
+        // the DFlash2's prewarm runs in the prefill (before the prompt tail's append_context); the decode loop only drafts
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         basalt::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
@@ -264,7 +267,7 @@ int decode(Context& context) {
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
-                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp ? drafts[(size_t) i - 1]
+                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp || use_dflash2 ? drafts[(size_t) i - 1]
                                                     : at < oracle.size() ? (int32_t) oracle[at] : 0;
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
@@ -286,6 +289,10 @@ int decode(Context& context) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            if (draft_log != nullptr) {
+                std::fprintf(draft_log, "W %d %d %d\n", T, a, from_sfx ? 1 : 0);
+                std::fflush(draft_log);
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -324,18 +331,32 @@ int decode(Context& context) {
             // accepted tokens' target hidden states; fill the drafter's local cyclic K/V with them, then draft the next
             // block.  The drafts go through the same verify window (drafter-agnostic), so the output is lossless.
             if (use_dflash2 && (int64_t) produced.size() < o.max_new) {
+                const cudaError_t sticky = cudaGetLastError();
+                if (sticky != cudaSuccess) {
+                    basalt::log::error("basalt generate", "dflash2: sticky CUDA error before the tap readback: %s",
+                                       cudaGetErrorString(sticky));
+                    return 1;
+                }
                 const size_t nt = dflash2.geom().target_layer_ids.size();
                 std::vector<float> dflash2_features((size_t) (a + 1) * nt * (size_t) g.n_embd);
-                if (cudaMemcpy(dflash2_features.data(), dflash2_tap_buf,
+                // the tap's row 0 is the window's anchor (position p-1); rows 1..a+1 are the accepted tokens
+                // (positions p..p+a) - the readback skips the anchor row so the append's positions are right
+                if (cudaMemcpy(dflash2_features.data(),
+                               dflash2_tap_buf + (size_t) nt * (size_t) g.n_embd,
                                (size_t) (a + 1) * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    basalt::log::error("basalt generate", "the DFlash2 tap readback failed");
+                    char buf[256];
+                    std::snprintf(buf, sizeof buf, "the DFlash2 tap readback failed: %s (a=%d spec=%d buf=%p rows=%d)" ,
+                                  cudaGetErrorString(cudaGetLastError()), a, o.spec, (void*) dflash2_tap_buf, o.spec);
+                    basalt::log::error("basalt generate", "%s", buf);
                     return 1;
                 }
                 if (!dflash2.append_context(dflash2_features.data(), a + 1, p, err)) {
                     basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
                     return 1;
                 }
-                if (!dflash2.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data())) {
+                // the next window's width is at most the spec's (the suffix lookup widens it past S_mtp); the graph
+                // always drafts the block's K, the window takes what it verifies
+                if (!dflash2.draft(std::min(o.spec, 8), outv.data(), p, a, drafts.data(), err, dprob.data())) {
                     basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
                     return 1;
                 }
