@@ -58,6 +58,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
         else if (a == "--dump-residual") o.dump_residual = next("--dump-residual");
+        else if (a == "--dump-taps") o.dump_taps = next("--dump-taps");
         else if (a == "--dump-mixed") o.dump_mixed = next("--dump-mixed");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-io") o.ple_io = next("--ple-io");

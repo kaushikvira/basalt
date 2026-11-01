@@ -1,5 +1,6 @@
 #include "context.hpp"
 #include "basalt/core/diag.hpp"
+#include "basalt/core/tap_dumper.hpp"
 
 namespace basalt::program::generate {
 
@@ -89,6 +90,7 @@ int decode(Context& context) {
         // (the target's hidden state) for its rows into the tap's buffer, which the decode loop feeds to append_context.
         const bool use_dflash2 = !o.dflash2_src.empty();
         float* dflash2_tap_buf = nullptr;
+        basalt::core::TapDumper tap_dumper;
         if (use_dflash2) {
             // the drafter is bound in the prefill (its bind allocates the device pool and is not idempotent); here only
             // the verify window's hidden-state tap is configured: after each tapped layer the window records the
@@ -102,6 +104,13 @@ int decode(Context& context) {
             }
             std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
             ver.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf);
+            // Dump mode: open the TapDumper for the decode's per-round writes.
+            if (!o.dump_taps.empty()) {
+                if (!tap_dumper.open(o.dump_taps, nt, g.n_embd, err)) {
+                    basalt::log::error("basalt generate", "%s", err.c_str());
+                    return 1;
+                }
+            }
         }
         // DF2_PROFILE=1: per-round phase timing for the DFlash2 path (verify window, tap readback, append,
         // draft graph) to locate the draft-graph cost.  Accumulated over the timed rounds, printed at the end.
@@ -363,6 +372,13 @@ int decode(Context& context) {
                     return 1;
                 }
                 if (df2prof.on) df2prof.readback += std::chrono::duration<double, std::milli>(Clock::now() - tr0).count();
+                // Dump mode: write the committed tokens' taps + ids to the TapDumper.  A pure read;
+                // the decode's arithmetic is untouched.
+                if (tap_dumper.open()) {
+                    std::vector<int32_t> committed((size_t) (a + 1));
+                    for (int i = 0; i <= a; ++i) committed[(size_t) i] = outv[(size_t) i];
+                    tap_dumper.write_record_f32(committed.data(), dflash2_features.data(), a + 1);
+                }
                 const Clock::time_point ta0 = df2prof.on ? Clock::now() : Clock::time_point{};
                 if (!dflash2.append_context(dflash2_features.data(), a + 1, p, err)) {
                     basalt::log::error("basalt generate", "dflash2: %s", err.c_str());

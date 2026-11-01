@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/tap_dumper.hpp"
 
 namespace basalt::program::generate {
 
@@ -98,6 +99,7 @@ int prefill(Context& context) {
         // re-bind it (its bind is not idempotent - it allocates the device pool).
         float* dflash2_tap_buf = nullptr;
         int64_t dflash2_tap_n = 0;
+        basalt::core::TapDumper tap_dumper;   // must outlive the on_chunk lambda (which runs during prefill.run)
         if (dflash2_on) {
             if (!dflash2.bind(wt, &native_head, nullptr, err)) {
                 return fatal_start_error(err);
@@ -110,20 +112,46 @@ int prefill(Context& context) {
             if (n_batched > 0) {
                 const auto& dg = dflash2.geom();
                 const int nt = (int) dg.target_layer_ids.size();
-                const int64_t dflash2_win = dg.sliding_window;
-                if (cudaMalloc(&dflash2_tap_buf, (size_t) dflash2_win * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+                const bool dump_mode = !o.dump_taps.empty();
+                // In dump mode, size the buffer to the full chunk (every token); otherwise the sliding window.
+                const int64_t buf_rows = dump_mode ? o.prefill_chunk : dg.sliding_window;
+                if (cudaMalloc(&dflash2_tap_buf, (size_t) buf_rows * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
                     basalt::log::error("basalt generate", "the DFlash2 prefill tap buffer failed");
                     return 1;
                 }
                 std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
-                prefill.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf);
+                prefill.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf, dump_mode);
+                // Dump mode: open the TapDumper and set the on_chunk callback to write each chunk's taps.
+                if (dump_mode) {
+                    if (!tap_dumper.open(o.dump_taps, nt, g.n_embd, err)) {
+                        basalt::log::error("basalt generate", "%s", err.c_str());
+                        return 1;
+                    }
+                    auto prev_on_chunk = prefill.on_chunk;
+                    prefill.on_chunk = [&, prev_on_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                        const size_t nt2 = dflash2.geom().target_layer_ids.size();
+                        std::vector<float> taps((size_t) T * nt2 * (size_t) g.n_embd);
+                        if (cudaMemcpy(taps.data(), dflash2_tap_buf, (size_t) T * nt2 * (size_t) g.n_embd * 4,
+                                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            e = "tap dump: readback failed";
+                            return false;
+                        }
+                        std::vector<int32_t> toks((size_t) T);
+                        for (int64_t t = 0; t < T; ++t) toks[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t)];
+                        tap_dumper.write_record_f32(toks.data(), taps.data(), (int) T);
+                        if (prev_on_chunk) return prev_on_chunk(R_rows, T, p0, e);
+                        return true;
+                    };
+                }
             }
         }
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             return fatal_start_error(err);
         }
-        // the prompt's tail (the drafter's sliding window) into the DFlash2 drafter's local cyclic K/V
-        if (dflash2_on && dflash2_tap_buf != nullptr) {
+        // the prompt's tail (the drafter's sliding window) into the DFlash2 drafter's local cyclic K/V.
+        // In dump mode the on_chunk callback already read back every chunk; the tail append_context is
+        // skipped (spec=0 means no drafting, the drafter's local K/V is unused).
+        if (dflash2_on && dflash2_tap_buf != nullptr && o.dump_taps.empty()) {
             dflash2_tap_n = std::min((int64_t) dflash2.geom().sliding_window, n_batched);
             const size_t nt = dflash2.geom().target_layer_ids.size();
             std::vector<float> dflash2_features((size_t) dflash2_tap_n * nt * (size_t) g.n_embd);
@@ -135,8 +163,8 @@ int prefill(Context& context) {
                 basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
                 return 1;
             }
-            cudaFree(dflash2_tap_buf);
         }
+        if (dflash2_tap_buf != nullptr) cudaFree(dflash2_tap_buf);
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();

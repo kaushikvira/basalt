@@ -173,8 +173,10 @@ public:
     /// The DFlash2 drafter's hidden-state tap: after each tapped layer of a chunk, the prefill records the
     /// hyper-connection mix (the target's hidden state, n_embd wide) for the chunk's rows into `features` (device,
     /// [T, n_taps, n_embd] f32, token-major).  A pure read; the prefill's arithmetic is untouched.  Set before `run`.
-    void set_dflash2_tap(const int64_t* layers, int n_taps, float* features) {
-        tap_layers_ = layers; tap_n_taps_ = n_taps; tap_features_ = features;
+    /// When `dump` is true, the full chunk is recorded (not just the tail 2048); the buffer must be sized to the
+    /// full chunk.  The caller reads back the buffer in `on_chunk` and writes it to the TapDumper.
+    void set_dflash2_tap(const int64_t* layers, int n_taps, float* features, bool dump = false) {
+        tap_layers_ = layers; tap_n_taps_ = n_taps; tap_features_ = features; tap_dump_ = dump;
     }
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
@@ -237,6 +239,7 @@ private:
     const int64_t* tap_layers_ = nullptr;
     int tap_n_taps_ = 0;
     float* tap_features_ = nullptr;
+    bool tap_dump_ = false;   ///< dump mode: record the full chunk (not just the tail 2048)
 
     std::string next_err_;
     std::future<bool> next_run_;

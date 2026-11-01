@@ -46,6 +46,11 @@ struct Options {
     std::string kv = "fp16";   // KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
+    /// --dump-taps FILE: write the target's 5-layer hidden-state taps + token ids to a raw binary
+    /// file (the .taps format, tap_dumper.hpp) for the DFlash2 retrain's data collection.  A pure
+    /// read; the engine's arithmetic is untouched.  Needs --dflash2 (the tap is only wired when
+    /// the drafter is on).  Empty (the default): off.
+    std::string dump_taps;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the large GEMV does not.
     std::string dump_mixed;

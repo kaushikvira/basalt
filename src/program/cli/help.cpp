@@ -68,6 +68,10 @@ void usage() {
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
+                 "  --dump-taps FILE     write the target's 5-layer hidden-state taps + token ids to FILE\n"
+                 "                       (the .taps raw binary format; needs --dflash2).  A pure read;\n"
+                 "                       the output is bit-identical with or without the flag.  For the\n"
+                 "                       DFlash2 retrain's data collection (RETRAIN_PLAN.md §2.1)\n"
 
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
