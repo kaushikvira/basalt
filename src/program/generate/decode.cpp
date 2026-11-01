@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/diag.hpp"
 
 namespace basalt::program::generate {
 
@@ -14,6 +15,7 @@ int decode(Context& context) {
     auto& ple_table = *context.ple_table;
     auto& d_parts = *context.d_parts;
     auto& mtp = *context.mtp;
+    auto& dflash2 = *context.dflash2;
     auto& n_vocab = *context.n_vocab;
     auto& native_head = *context.native_head;
     auto& d_logits = *context.d_logits;
@@ -82,6 +84,32 @@ int decode(Context& context) {
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             return fatal_start_error(err);
         }
+        // The DFlash2 block-diffusion drafter: bound like the MTP (the target's embedding + head).  Its hidden-state
+        // tap is configured on the verify window: after each tapped layer the window records the hyper-connection mix
+        // (the target's hidden state) for its rows into the tap's buffer, which the decode loop feeds to append_context.
+        const bool use_dflash2 = !o.dflash2_src.empty();
+        float* dflash2_tap_buf = nullptr;
+        if (use_dflash2) {
+            // the drafter is bound in the prefill (its bind allocates the device pool and is not idempotent); here only
+            // the verify window's hidden-state tap is configured: after each tapped layer the window records the
+            // hyper-connection mix (the target's hidden state) for its rows, which the loop feeds to append_context.
+            const auto& dg = dflash2.geom();
+            const int nt = (int) dg.target_layer_ids.size();
+            // the window's T rows (the anchor + up to spec-1 accepted) plus the readback's one-row skip: spec + 1
+            if (cudaMalloc(&dflash2_tap_buf, (size_t) (o.spec + 1) * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+                basalt::log::error("basalt generate", "the DFlash2 tap buffer failed");
+                return 1;
+            }
+            std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
+            ver.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf);
+        }
+        // DF2_PROFILE=1: per-round phase timing for the DFlash2 path (verify window, tap readback, append,
+        // draft graph) to locate the draft-graph cost.  Accumulated over the timed rounds, printed at the end.
+        struct Df2Prof {
+            bool on = std::getenv("DF2_PROFILE") != nullptr;
+            double verify = 0, readback = 0, append = 0, draft = 0, round = 0;
+            int64_t n = 0;
+        } df2prof;
         ver.set_sampling(sp);   // the CLI's own sampling; no penalties here
         if (use_mtp) mtp.begin_request(o.tokens.data(), (int64_t) o.tokens.size());
         drive.d.plan = ver.plan_sink();
@@ -194,6 +222,10 @@ int decode(Context& context) {
         // first cell)
         bool first_window = true;
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
+        // --draft-log FILE: one line per window (T, accepted, from-suffix), for draft-policy study (the serve
+        // path's W lines; the harness parses the first two fields)
+        static FILE* const draft_log = basalt::core::diagnostics().draft_log.empty() ? nullptr
+            : std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
@@ -202,6 +234,7 @@ int decode(Context& context) {
             basalt::log::error("basalt", "mtp: capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
+        // the DFlash2's prewarm runs in the prefill (before the prompt tail's append_context); the decode loop only drafts
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         basalt::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
@@ -220,6 +253,8 @@ int decode(Context& context) {
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
             }
             if (first_window) T = 1;
+            // the DFlash2 block is 8 tokens (anchor + 7 drafts); the window cannot exceed it (the drafter's K = 7)
+            if (use_dflash2) T = std::min(T, 8);
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -239,7 +274,7 @@ int decode(Context& context) {
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
-                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp ? drafts[(size_t) i - 1]
+                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp || use_dflash2 ? drafts[(size_t) i - 1]
                                                     : at < oracle.size() ? (int32_t) oracle[at] : 0;
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
@@ -250,9 +285,11 @@ int decode(Context& context) {
             // the previous adapt round's copies land first: with a non-blocking query, whether a swapped-in expert ran
             // on the GPU or the CPU (they round differently) would depend on the copy's timing
             apply_pending(true);
+            const Clock::time_point tv0 = df2prof.on ? Clock::now() : Clock::time_point{};
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 return fatal_start_error(err);
             }
+            if (df2prof.on) df2prof.verify += std::chrono::duration<double, std::milli>(Clock::now() - tv0).count();
             if (drive.d.failed) {
                 basalt::log::error("basalt generate", "the expert pool failed at layer %lld expert %lld: %s",
                              (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
@@ -261,6 +298,10 @@ int decode(Context& context) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            if (draft_log != nullptr) {
+                std::fprintf(draft_log, "W %d %d %d\n", T, a, from_sfx ? 1 : 0);
+                std::fflush(draft_log);
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -295,6 +336,51 @@ int decode(Context& context) {
             if (use_mtp) mtp.set_cum_th(cum_adapt.th());
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
+            // The DFlash2 drafter (mutually exclusive with the MTP): the verify window's hidden-state tap holds the
+            // accepted tokens' target hidden states; fill the drafter's local cyclic K/V with them, then draft the next
+            // block.  The drafts go through the same verify window (drafter-agnostic), so the output is lossless.
+            if (use_dflash2 && (int64_t) produced.size() < o.max_new) {
+                const cudaError_t sticky = cudaGetLastError();
+                if (sticky != cudaSuccess) {
+                    basalt::log::error("basalt generate", "dflash2: sticky CUDA error before the tap readback: %s",
+                                       cudaGetErrorString(sticky));
+                    return 1;
+                }
+                const size_t nt = dflash2.geom().target_layer_ids.size();
+                std::vector<float> dflash2_features((size_t) (a + 1) * nt * (size_t) g.n_embd);
+                const Clock::time_point tr0 = df2prof.on ? Clock::now() : Clock::time_point{};
+                // the tap's rows 0..a are the committed tokens (the anchor x at position p, then the accepted
+                // drafts d1..da at positions p+1..p+a); append them at [p, p+a+1) so the drafter's local K/V
+                // holds the committed sequence.  (The earlier readback skipped the anchor row and took the
+                // non-accepted d_{a+1} instead - an off-by-one that fed the drafter the wrong tokens.)
+                if (cudaMemcpy(dflash2_features.data(),
+                               dflash2_tap_buf,
+                               (size_t) (a + 1) * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof buf, "the DFlash2 tap readback failed: %s (a=%d spec=%d buf=%p rows=%d)" ,
+                                  cudaGetErrorString(cudaGetLastError()), a, o.spec, (void*) dflash2_tap_buf, o.spec);
+                    basalt::log::error("basalt generate", "%s", buf);
+                    return 1;
+                }
+                if (df2prof.on) df2prof.readback += std::chrono::duration<double, std::milli>(Clock::now() - tr0).count();
+                const Clock::time_point ta0 = df2prof.on ? Clock::now() : Clock::time_point{};
+                if (!dflash2.append_context(dflash2_features.data(), a + 1, p, err)) {
+                    basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                    return 1;
+                }
+                if (df2prof.on) df2prof.append += std::chrono::duration<double, std::milli>(Clock::now() - ta0).count();
+                const Clock::time_point td0 = df2prof.on ? Clock::now() : Clock::time_point{};
+                // the next window's width is at most the spec's (the suffix lookup widens it past S_mtp); the graph
+                // always drafts the block's K, the window takes what it verifies
+                if (!dflash2.draft(std::min(o.spec, 8), outv.data(), p, a, drafts.data(), err, dprob.data())) {
+                    basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                    return 1;
+                }
+                if (df2prof.on) {
+                    df2prof.draft += std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
+                    ++df2prof.n;
+                }
+            }
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -309,10 +395,20 @@ int decode(Context& context) {
                 basalt::log::info("basalt generate", "position %lld, %lld tokens, %lld rounds", (long long) p,
                              (long long) produced.size(), (long long) rounds);
         }
+        // DF2_PROFILE: print the per-phase averages over the timed rounds
+        if (df2prof.on && df2prof.n > 0) {
+            const double n = (double) df2prof.n;
+            basalt::log::info("basalt generate",
+                "DF2_PROFILE rounds=%lld verify=%.3f readback=%.3f append=%.3f draft=%.3f ms/round "
+                "(verify+readback+append+draft=%.3f)",
+                (long long) df2prof.n, df2prof.verify / n, df2prof.readback / n, df2prof.append / n,
+                df2prof.draft / n, (df2prof.verify + df2prof.readback + df2prof.append + df2prof.draft) / n);
+        }
         // the last commit (set_commit_async) before anything reads the session again
         if (!ver.wait_commit(err)) {
             return fatal_start_error(err);
         }
+        if (dflash2_tap_buf != nullptr) cudaFree(dflash2_tap_buf);
         cli::print_speculation({
             .o = o, .g = g, .drive = drive,
             .pool = pool, .src = src, .srcp = srcp,

@@ -47,6 +47,8 @@ int dispatch(Context& context) {
     auto& slot0_is_solo = *context.slot0_is_solo;
     auto& mtp = *context.mtp;
     auto& mtp_on = *context.mtp_on;
+    auto& dflash2 = *context.dflash2;
+    auto& dflash2_on = *context.dflash2_on;
     auto& mtp_kv = *context.mtp_kv;
     auto& n_vocab = *context.n_vocab;
     auto& grammar_vocab = *context.grammar_vocab;
@@ -177,6 +179,8 @@ int dispatch(Context& context) {
             .mtp = mtp,
             .mtp_on = mtp_on,
             .mtp_kv = mtp_kv,
+            .dflash2 = dflash2,
+            .dflash2_on = dflash2_on,
             .n_vocab = n_vocab,
             .grammar_vocab = grammar_vocab,
             .native_head = native_head,

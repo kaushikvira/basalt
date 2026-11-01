@@ -506,6 +506,99 @@ class Mtp:
             yield mtp_blob(g, d)
 
 
+# ------------------------------------------------------------------ the DFlash2 drafter
+class DFlash2:
+    """The DFlash2 block-diffusion drafter's sections, from a directory containing model.safetensors + config.json.
+
+    Emits `dflash2/dense` (the weight pool: norms as F32, the rest BF16, 256-byte aligned) and
+    `dflash2/dense.index` (one line per tensor: name kind rows cols offset bytes).
+    """
+
+    def __init__(self, src: str):
+        self.src = pathlib.Path(src)
+        st = self.src / "model.safetensors"
+        cfg = self.src / "config.json"
+        if not st.is_file():
+            raise ConvertError(f"{st} not found")
+        if not cfg.is_file():
+            raise ConvertError(f"{cfg} not found")
+        self.config = json.loads(cfg.read_text())
+        self.head, self.data_base = read_safetensors_header(str(st))
+        self.tensors = {k: v for k, v in self.head.items() if k != "__metadata__"}
+        self.dense_lines: list[str] = []
+        self.dense_bytes = 0
+
+    def _tensor_bytes(self, name: str) -> np.ndarray:
+        """The tensor's raw bytes as a uint8 array."""
+        t = self.tensors[name]
+        a, b = t["data_offsets"]
+        with open(self.src / "model.safetensors", "rb") as f:
+            f.seek(self.data_base + a)
+            return np.frombuffer(f.read(b - a), dtype=np.uint8)
+
+    def dense_chunks(self):
+        """The dense section: every tensor in sorted order, 256-byte aligned; fills `dense_lines`."""
+        off = 0
+        for name in sorted(self.tensors):
+            t = self.tensors[name]
+            shape = t["shape"]
+            raw = self._tensor_bytes(name)
+            # guard (S1): the source must be BF16/F16 and the byte count must match 2*prod(shape)
+            if t["dtype"] != "BF16":
+                raise ConvertError(f"dflash2: {name} dtype {t['dtype']} (expected BF16)")
+            if len(raw) != 2 * int(np.prod(shape)):
+                raise ConvertError(f"dflash2: {name} bytes {len(raw)} != 2*prod(shape)={2 * int(np.prod(shape))}")
+            if len(shape) == 1:
+                # norm weights: BF16 -> F32 (no +1; the source is already in gain form)
+                f32 = (raw.view("<u2").astype(np.uint32) << 16).view(np.float32).astype(np.float32)
+                data, kind, rows, cols = f32.tobytes(), "f32", 1, f32.size
+            else:
+                # multi-dim: keep as BF16, flatten to 2-D for the index
+                u16 = raw.view("<u2").reshape(shape[0], -1)
+                data, kind, rows, cols = u16.tobytes(), "bf16", shape[0], int(np.prod(shape[1:]))
+            pad = (-off) % 256
+            if pad:
+                yield b"\0" * pad
+                off += pad
+            yield data
+            self.dense_lines.append(f"{name} {kind} {rows} {cols} {off} {len(data)}")
+            off += len(data)
+        self.dense_bytes = off
+
+    def dense_index(self) -> bytes:
+        return ("\n".join(self.dense_lines) + "\n").encode("utf-8")
+
+    def provenance(self) -> dict:
+        """The meta[\"dflash2\"] entry."""
+        st_sha = hashlib.sha256()
+        with open(self.src / "model.safetensors", "rb") as f:
+            for b in iter(lambda: f.read(1 << 24), b""):
+                st_sha.update(b)
+        cfg_sha = hashlib.sha256((self.src / "config.json").read_bytes()).hexdigest()
+        dflash_cfg = self.config.get("dflash_config", {})
+        return {
+            "source": self.src.name,
+            "model_sha256": st_sha.hexdigest(),
+            "config_sha256": cfg_sha,
+            "n_layers": self.config.get("num_hidden_layers", 0),
+            "hidden_size": self.config.get("hidden_size", 0),
+            "n_tensors": len(self.tensors),
+            "dense_bytes": self.dense_bytes,
+            # full geometry the loader needs (S2):
+            "dflash_config": dflash_cfg,
+            "head_dim": self.config.get("head_dim"),
+            "num_attention_heads": self.config.get("num_attention_heads"),
+            "num_key_value_heads": self.config.get("num_key_value_heads"),
+            "intermediate_size": self.config.get("intermediate_size"),
+            "vocab_size": self.config.get("vocab_size"),
+            "max_position_embeddings": self.config.get("max_position_embeddings"),
+            "rms_norm_eps": self.config.get("rms_norm_eps"),
+            "rope_theta": self.config.get("rope_parameters", {}).get("rope_theta", self.config.get("rope_theta")),
+            "layer_types": self.config.get("layer_types"),
+            "sliding_window": self.config.get("sliding_window"),
+        }
+
+
 def draft_vocab_bytes(path, n_vocab: int | None = None) -> bytes:
     """A draft vocabulary file: int32 token ids, none outside the vocabulary."""
     data = pathlib.Path(path).read_bytes()

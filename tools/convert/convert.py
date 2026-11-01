@@ -13,6 +13,9 @@ Inputs
                      byte (BASE's vocabulary must be the GGUF's); replaces --mmproj, --mtp-*, --draft-vocab, --profile*, --hc8
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
+  --dflash2-source DIR  the DFlash2 block-diffusion drafter (model.safetensors + config.json); emits dflash2/* sections
+  --q8-head             dequantize the GGUF's output head and store it Q8_0 in the pack (the DFlash2 drafter's head
+                     scoring is a Q8_0 kernel; an IQ3_S GGUF's Q6_K head needs this)
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
                      with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
                      With --sections-from and --checkpoint it replaces the mtp/dense copied from BASE (same size required)
@@ -57,6 +60,8 @@ import json
 import math
 import os
 import re
+
+import numpy as np
 import struct
 import subprocess
 import sys
@@ -146,6 +151,30 @@ def source_tensors(model: S.SourceModel):
     return kv, tensors
 
 
+def q8_head(tensors: list) -> bytes | None:
+    """`--q8-head`: the head dequantized to f32 and re-quantized Q8_0 (ggml reference rounding), the bytes for the
+    gguf section, and the tensors entry rewritten in place.  None when the head is already Q8_0.  The DFlash2
+    drafter's head scoring is a Q8_0 kernel; an IQ3_S GGUF's Q6_K head would not fit it."""
+    import ggufq
+    from gguf_reader import TensorInfo
+    for i, (n, p, off, nb, t) in enumerate(tensors):
+        if n != "output.weight":
+            continue
+        if t.type_name == "Q8_0":
+            print("note: the head is already Q8_0", flush=True)
+            return None
+        print(f"converting the head {t.type_name} -> Q8_0 ...", flush=True)
+        with open(p, "rb") as f:
+            f.seek(off)
+            raw = np.frombuffer(f.read(nb), dtype=np.uint8)
+        x = ggufq.dequantize(raw, ggufq.GGMLQuantizationType[t.type_name])
+        data = S.q8_0(x)
+        tensors[i] = (n, p, off, len(data), TensorInfo(name=n, shape=list(t.shape), type_id=8, type_name="Q8_0",
+                                                       offset=t.offset))
+        return data
+    die("--q8-head: the source has no output.weight")
+
+
 # ------------------------------------------------------------------ the conversion
 class Job:
     def __init__(self, writer: ModelWriter):
@@ -213,9 +242,11 @@ def convert(a) -> None:
         print("reading the source GGUFs ...", flush=True)
         model = S.SourceModel(source_paths(a.gguf))
         kv, tensors = source_tensors(model)
+        head_data = q8_head(tensors) if getattr(a, "q8_head", False) else None
         dense = S.Dense(model, a.compat_bf16)
         experts = S.Experts(model)
         mtp = S.Mtp(a.mtp_source, a.mtp_dense) if a.mtp_source else None
+        dflash2 = S.DFlash2(a.dflash2_source) if a.dflash2_source else None
         n_vocab = len(kv.get("tokenizer.ggml.tokens") or []) or None
         draft_vocab = S.draft_vocab_bytes(a.draft_vocab, n_vocab) if a.draft_vocab else None
         if base is not None:
@@ -238,7 +269,7 @@ def convert(a) -> None:
         err = str(e)
     if err is not None:
         # Drop every view of the source files so they are unmapped (and deletable) before the process exits.
-        model = dense = experts = mtp = None
+        model = dense = experts = mtp = dflash2 = None
         gc.collect()
         die(err)
 
@@ -267,13 +298,15 @@ def convert(a) -> None:
             job.chunks("experts", experts.chunks())
             job.bytes("experts.layout", experts.layout_text())
             t = time.time()
-            offs = w.add_parts("gguf", [(src, off, size) for _, src, off, size, _ in tensors], TENSOR_ALIGN)
+            parts = [head_data if n == "output.weight" and head_data is not None else (src, off, size)
+                     for n, src, off, size, _ in tensors]
+            offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)
             tensor_offsets = dict(zip((x[0] for x in tensors), offs))
             copied = []
             if base is not None:
                 for name in base.names():
-                    if name != "vision/text_vocab" and (name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8")):
+                    if name != "vision/text_vocab" and (name.startswith(("mtp/", "vision/", "dflash2/")) or name in ("profile", "hc8")):
                         off, size = base.section(name)
                         job.file(name, a.sections_from, off, size)
                         if w.entries[-1][3] != base.sections[name][2]:
@@ -294,6 +327,9 @@ def convert(a) -> None:
                 job.chunks("mtp/experts", mtp.expert_chunks())
                 if draft_vocab is not None:
                     job.bytes("mtp/draft_vocab", draft_vocab)
+            if dflash2 is not None:
+                job.chunks("dflash2/dense", dflash2.dense_chunks())
+                job.bytes("dflash2/dense.index", dflash2.dense_index())
             if base is None:
                 job.bytes("profile", profile_blob)
             if a.hc8:
@@ -321,7 +357,10 @@ def convert(a) -> None:
                 "tensors": {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                 "bytes": nb, "offset": tensor_offsets[n]}
                             for n, _, _, nb, t in tensors},
-                "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
+                "conversions": ({"compat_bf16": a.compat_bf16, "tensors": dense.records,
+                                 "head": {"output.weight": {"src_type": "Q6_K", "dst_type": "Q8_0",
+                                                           "method": "dequantized to f32, ggml reference Q8_0 rounding"}}}
+                         if head_data is not None else {"compat_bf16": a.compat_bf16, "tensors": dense.records}),
                 "sampling": SAMPLING, "license": model_license(kv),
                 "profile": prof,
                 "hc8": base_meta.get("hc8") if base is not None else {"bytes": Path(a.hc8).stat().st_size} if a.hc8 else None,
@@ -329,6 +368,7 @@ def convert(a) -> None:
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
+                "dflash2": dflash2.provenance() if dflash2 is not None else (base_meta.get("dflash2") if base is not None else None),
                 "vision": base_meta.get("vision") if base is not None else None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
             }
@@ -349,7 +389,7 @@ def convert(a) -> None:
                 pass
             partial.unlink(missing_ok=True)
     if err is not None:
-        model = dense = experts = mtp = job = None
+        model = dense = experts = mtp = dflash2 = job = None
         gc.collect()
         die(err)
     os.replace(partial, out)
@@ -428,7 +468,7 @@ def from_checkpoint(a) -> None:
             tensor_offsets = dict(zip(names, offs))
             tuned_sha = None
             for name in base.names():
-                if name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8"):
+                if name.startswith(("mtp/", "vision/", "dflash2/")) or name in ("profile", "hc8"):
                     off, size = base.section(name)
                     if name == "mtp/dense" and a.mtp_dense:
                         tuned = Path(a.mtp_dense)
@@ -443,7 +483,7 @@ def from_checkpoint(a) -> None:
                         continue
                     job.file(name, src, off, size)
             for name, _, _, digest in w.entries:
-                if name in base.sections and name.startswith(("mtp/", "vision/", "profile", "hc8")) \
+                if name in base.sections and name.startswith(("mtp/", "vision/", "dflash2/", "profile", "hc8")) \
                         and not (name == "mtp/dense" and a.mtp_dense) \
                         and digest != base.sections[name][2]:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
@@ -465,7 +505,7 @@ def from_checkpoint(a) -> None:
                     "scale": ple.scale}]},
                 "sampling": SAMPLING, "license": model_license(kv),
             }
-            for k in ("profile", "hc8", "mtp", "vision"):
+            for k in ("profile", "hc8", "mtp", "vision", "dflash2"):
                 meta[k] = base_meta.get(k)
             if tuned_sha:
                 meta["mtp"] = {**meta["mtp"], "dense": {"tuning": "self_distilled", "sha256": tuned_sha}}
@@ -481,7 +521,7 @@ def from_checkpoint(a) -> None:
                           "transforms": {k: C.METHODS[k] for k in used}},
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
-                                  "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/")) or
+                                  "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/", "dflash2/")) or
                                              n in ("profile", "hc8")]}}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
@@ -587,6 +627,10 @@ def main():
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
+    ap.add_argument("--dflash2-source", metavar="DIR", help="the DFlash2 drafter's safetensors + config.json directory")
+    ap.add_argument("--q8-head", action="store_true",
+                    help="dequantize the GGUF's output head and store it Q8_0 in the pack (the DFlash2 drafter's "
+                         "head scoring is a Q8_0 kernel; an IQ3_S GGUF's Q6_K head needs this)")
     ap.add_argument("--mtp-dense", metavar="FILE", help="a tuned (self-distilled) mtp/dense section to embed (needs --mtp-source)")
     ap.add_argument("--draft-vocab", metavar="FILE", help="int32 token ids the draft head may propose (needs --mtp-source)")
     ap.add_argument("--profile", metavar="FILE", help="an expert profile to store as it is (--expert-profile-save's file)")

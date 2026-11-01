@@ -379,7 +379,9 @@ Flow Request::decode() {
                 basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             });
         };
-        if (chain) {
+        // the DFlash2 drafter does not use the pipelined chain (its own K/V + tap readback serialize the round);
+        // it takes the plain commit-then-draft path below
+        if (chain && !runtime_.dflash2_on) {
             // the draft launches first; the commit, the adaptive round and the output go in its shadow
             int n_emit = 0;
             bool eos_pre = false;
@@ -560,8 +562,34 @@ Flow Request::decode() {
         basalt::core::decode_gaps().mark(5);
         if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
         runtime_.mtp.set_cum_th(cum_adapt.th());
-        const bool drafted = eos || produced_n >= max_new || !runtime_.mtp_on ||
-                             runtime_.mtp.draft(T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data());
+        bool drafted = true;
+        if (eos || produced_n >= max_new) {
+            drafted = true;
+        } else if (runtime_.dflash2_on) {
+            // The DFlash2 block-diffusion drafter (mutually exclusive with the MTP): the verify window's
+            // hidden-state tap holds the committed tokens' target hidden states; read back rows 0..a (the anchor
+            // x at position p, then the accepted drafts d1..da at p+1..p+a), append them to the drafter's local
+            // K/V, and draft the next block.  The drafts go through the same drafter-agnostic verify window.
+            const size_t nt = runtime_.dflash2.geom().target_layer_ids.size();
+            std::vector<float> dflash2_features((size_t) (a + 1) * nt * (size_t) runtime_.g.n_embd);
+            if (cudaMemcpy(dflash2_features.data(), runtime_.dflash2_tap_buf_,
+                           (size_t) (a + 1) * nt * (size_t) runtime_.g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::printf("ERR dflash2: the tap readback failed\n");
+                return Flow::error;
+            }
+            if (!runtime_.dflash2.append_context(dflash2_features.data(), a + 1, p, runtime_.err)) {
+                std::printf("ERR dflash2: %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            drafted = runtime_.dflash2.draft(std::min(runtime_.S, 8), outv.data(), p, a, drafts.data(),
+                                             runtime_.err, dprob.data());
+            if (!drafted) {
+                std::printf("ERR dflash2: %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+        } else if (runtime_.mtp_on) {
+            drafted = runtime_.mtp.draft(T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data());
+        }
         {
             const Clock::time_point tw3 = Clock::now();
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };

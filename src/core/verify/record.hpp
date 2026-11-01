@@ -26,6 +26,10 @@ struct Verifier::WindowRecorder {
     bool qsa(int64_t l, const LayerView& v, bool read_q8);
     bool post(int64_t l);
     bool head();
+    /// The DFlash2 drafter's hidden-state tap: after layer `l`'s FFN write, record the hyper-connection mix (n_embd
+    /// wide, the target's hidden state) for the window's T rows into the tap's features buffer, at the tapped-layer
+    /// slot `i`.  A pure read of the residual; the window's arithmetic is untouched.  No-op when the tap is off.
+    void tap(int64_t l, int i);
     float* Rt(int t) const { return v_.R_ + (size_t) t * HC * N; }
     void stamp(int64_t l, int i) const {
         if (v_.prof_on_) kernels::gpu_stamp(v_.prof_, (int) (l * kProfPer + i), cs);

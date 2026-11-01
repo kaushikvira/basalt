@@ -243,6 +243,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
             basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
+        tap_inj_ = b.take<float>(HC);   // the DFlash2 tap's gr_read inject scratch (the mix's per-stream write)
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);

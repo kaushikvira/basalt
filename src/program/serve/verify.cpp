@@ -140,6 +140,24 @@ int Runtime::init_verify() {
         basalt::log::error("basalt serve", "%s", err.c_str());
         return 1;
     }
+    // The DFlash2 block-diffusion drafter (mutually exclusive with the MTP): bound like the MTP (the target's
+    // embedding + head), its hidden-state tap configured on the verify window.  The decode loop reads the
+    // committed rows from the tap buffer, appends them to the drafter's local K/V, and drafts the next block.
+    if (dflash2_on) {
+        if (!dflash2.bind(wt, &native_head, nullptr, err)) {
+            basalt::log::error("basalt serve", "dflash2: %s", err.c_str());
+            return 1;
+        }
+        const auto& dg = dflash2.geom();
+        const int nt = (int) dg.target_layer_ids.size();
+        // the window's T rows (the anchor + up to spec-1 accepted) plus the readback's rows: spec + 1
+        if (cudaMalloc(&dflash2_tap_buf_, (size_t) (o.spec + 1) * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+            basalt::log::error("basalt serve", "the DFlash2 tap buffer failed");
+            return 1;
+        }
+        std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
+        ver.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf_);
+    }
     if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
         basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());
         return 1;
@@ -197,6 +215,10 @@ int Runtime::capture_windows() {
     if (mtp_on && (pipe_want || S_mtp < S)) mtp.set_max_drafts((pipe_on ? basalt::core::kMtpChainMax : S_mtp) - 1);
     if (mtp_on && !mtp.prewarm(err)) {
         basalt::log::error("basalt serve", "capturing the draft graphs failed: %s", err.c_str());
+        return 1;
+    }
+    if (dflash2_on && !dflash2.prewarm(err)) {
+        basalt::log::error("basalt serve", "dflash2: capturing the draft graph failed: %s", err.c_str());
         return 1;
     }
     ple_table.rearm_keepalive();   // a long load must not lapse the SSD keep-alive window before the first request

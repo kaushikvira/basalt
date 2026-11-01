@@ -381,6 +381,17 @@ public:
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
 
+    // ---- the DFlash2 drafter's hidden-state tap ----
+    // The DFlash2 drafter reads the target's hidden state (the hyper-connection mix, n_embd wide) at a set of tapped
+    // layers.  `set_dflash2_tap` configures it: after each tapped layer the window records the mix for its T rows into
+    // `features` (device, [T, n_taps, n_embd] f32, token-major).  The verify window's arithmetic is untouched - the tap
+    // is a pure read of the residual after the layer's FFN write.  Null layers disable it (the default).
+    void set_dflash2_tap(const int64_t* layers, int n_taps, float* features) {
+        tap_layers_ = layers; tap_n_taps_ = n_taps; tap_features_ = features;
+    }
+    /// The tap's features buffer (device, [T, n_taps, n_embd] f32) after a run; null when the tap is off.
+    float* dflash2_tap_features() const { return next_ ? next_->dflash2_tap_features() : tap_features_; }
+
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
@@ -531,6 +542,10 @@ private:
     float* hand_out_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    // the DFlash2 drafter's hidden-state tap: the tapped layer ids, their count, and the [T, n_taps, n_embd] f32 buffer
+    const int64_t* tap_layers_ = nullptr;
+    int tap_n_taps_ = 0;
+    float* tap_features_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
@@ -663,6 +678,7 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    float* tap_inj_ = nullptr;   // the DFlash2 tap's gr_read inject scratch
     // head split: CUDA0 computes rows [0, hs_rows_), the peer the rest; hs_rows_ 0 means no split
     int hs_rows_ = 0, hs_dev_ = -1;
     void* hs_w_ = nullptr;           // peer: head rows [hs_rows_, n_vocab_)
