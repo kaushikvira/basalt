@@ -1,5 +1,63 @@
 # DFlash2 Retrain — Log
 
+## 2026-11-01: Batched training loop + 1-epoch train + go/no-go (LOSE)
+
+**Commit:** (this entry)
+
+### Optimization: batched the forward (option A)
+The reference model's `DFlash2DraftModel.forward()` is already batch-compatible —
+fc+norm, the 5 decoder layers (SDPA with a `[1,1,q,k]` causal mask, dynamic conv,
+MLP) and RoPE all broadcast over the batch dim. So `DFlash2Trainer.forward()` now
+takes `[B, W, 5, 2560]` context + `[B]` anchors and runs one forward per batch;
+the per-sample Python loop is gone. Also: `--max-steps` for quick tests,
+logging every 5 steps (loss, ms/step, ETA, GPU GB), no per-step `.item()` syncs.
+
+### Measured speedup (B=32, W=2048, GPU 1)
+- Per-sample loop (baseline): **~540–560 ms/step** steady state
+- Batched: **~340–370 ms/step** steady state → **1.6×**, not the expected 3–5×.
+  The GPU was already busy per sample (each sample's forward is ~10–15 ms of
+  kernel time), so the launch-overhead premise overestimated the win.
+- Profiler: one step is 331 ms of pure CUDA kernel time (fc GEMM dominant), so
+  the loop is now at the GPU-bound floor. Further speedup = less compute
+  (W=1024 → ~2×), not better scheduling.
+
+### 1-epoch train (real taps, 99,488 tokens, 3,045 steps)
+- 18.0 min, avg loss 14.66 → 11.25 (final steps ~8.5–12, still falling)
+- GPU memory 11.0 GB (taps 2.55 GB + model 1.2 GB + head 2.4 GB + states/acts)
+- Checkpoint: `~/models/basalt-swift/dflash2-fn-finetuned/` — 81 tensors, all
+  BF16, same shapes/keys as the original, 1.2 GB. fc.weight mean |Δ| = 2.2e-5.
+
+### Pack + acceptance (go/no-go)
+- Pack: `replace_dflash2.py` (the base already carries a dflash2 section, so
+  `add_dflash2.py` refuses) → `Swift-1.5-FN-NVFP4-dflash2-ft.basalt` (123.1 GiB).
+  Written to `~/work/models/basalt-swift/` — `/home/kv/models` had only 52 GB free.
+- Bench (GPU 1, spec 8, greedy, seed 42, conv/struct/prose):
+
+| drafter | conv t/s (acc %) | struct t/s (acc %) | prose t/s (acc %) |
+|---|---|---|---|
+| **MTP (baseline)** | 229 (69.6) | 367 (97.4) | 208 (66.1) |
+| DFlash2 original | 43 (0.7) | 35 (1.1) | 41 (0.3) |
+| DFlash2 fine-tuned | 35 (0.4) | 34 (0.6) | 42 (0.5) |
+
+**Gate: acceptance ≥ 70% = WIN. Result: LOSE — MTP stays.**
+
+### Key finding: the DFlash2 *port* is broken, not the fine-tune
+The **original, unmodified** z-lab drafter also scores 0.3–1.1% acceptance while
+MTP scores 66–97% on the same fixtures. The fine-tuned drafter (0.4–0.6%) is
+statistically indistinguishable from the original — training worked (loss
+14.7 → 11.2 on 99.5K tokens of real taps), the pack is structurally correct
+(same sections, updated sha, 81/81 BF16 tensors), so the ~0.5% acceptance is a
+bug in the engine's DFlash2 path (tap extraction / fc+norm / RoPE positions /
+anchor handling — one of these), amplified by the BF16-train vs NVFP4-serve gap.
+Fixing the port is the prerequisite for any DFlash2 win; more training data on
+top of a broken port is wasted compute.
+
+### Next steps
+1. Debug the engine's DFlash2 decode path against the PyTorch reference (the
+   `/tmp/dflash2-fixture/` ref tensors from the earlier session exist for this).
+2. Only after the port accepts ≥ ~50% with the *original* drafter, re-run the
+   fine-tune (more data/epochs are then worth it — loss was still falling).
+
 ## 2026-11-01: Phase 4 steps 4-5 (PyTorch forward + training loop)
 
 **Commit:** (this entry)

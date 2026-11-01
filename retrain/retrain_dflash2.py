@@ -43,46 +43,53 @@ CONFIG_JSON = Path("/home/kv/work/models/dflash2-fn/config.json")
 # Tap file loading (custom binary format, not standard .npz)
 # ---------------------------------------------------------------------------
 
-def load_taps_file(path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+def load_taps_file(path: Path) -> tuple[np.ndarray, torch.Tensor, dict]:
     """Load the basalt --dump-taps binary file.
 
-    Returns (tokens[N] int32, taps[N, 5, 2560] float32, meta dict).
+    Returns (tokens[N] int32, taps[N, 5, 2560] torch.bfloat16 (CPU), meta dict).
+
+    The taps are kept in BF16 — their on-file dtype. Loading them as F32 would
+    upcast the frozen 2.5 GB target head to F32 per sample in the batch loop
+    (32 × 2.5 GB) and OOM. mmap keeps the 2.4 GB file out of RAM until the
+    per-record copies happen.
     """
+    import struct
+    size = path.stat().st_size
+    if size < 20:
+        raise ValueError(f"file too small: {size} bytes")
     with open(path, "rb") as f:
-        data = f.read()
-    if len(data) < 20:
-        raise ValueError(f"file too small: {len(data)} bytes")
-    magic = data[:4]
+        magic = f.read(4)
+        version, n_taps, n_embd, dtype = struct.unpack("<IIII", f.read(16))
     if magic != b"TAPS":
         raise ValueError(f"bad magic: {magic!r}")
-    import struct
-    version, n_taps, n_embd, dtype = struct.unpack_from("<IIII", data, 4)
     if version != 1:
         raise ValueError(f"unsupported version: {version}")
     if dtype != 1:
         raise ValueError(f"unsupported dtype: {dtype} (expected 1=BF16)")
 
-    off = 20
+    mm = np.memmap(path, dtype=np.uint8, mode="r", offset=20)
+    off = 0
+    n_bytes = mm.nbytes
     tokens_list, taps_list = [], []
-    while off < len(data):
-        n_tokens = struct.unpack_from("<I", data, off)[0]
+    while off < n_bytes:
+        n_tokens = struct.unpack_from("<I", mm, off)[0]
         off += 4
         n_tok_bytes = 4 * n_tokens
         n_tap_elems = n_tokens * n_taps * n_embd
         n_tap_bytes = 2 * n_tap_elems
-        if off + n_tok_bytes + n_tap_bytes > len(data):
+        if off + n_tok_bytes + n_tap_bytes > n_bytes:
             raise ValueError(f"truncated record at offset {off}")
-        tokens = np.frombuffer(data, dtype=np.int32, count=n_tokens, offset=off).copy()
+        tokens = np.frombuffer(mm[off:off + n_tok_bytes], dtype=np.int32).copy()
         off += n_tok_bytes
-        taps_raw = np.frombuffer(data, dtype=np.uint16, count=n_tap_elems, offset=off)
+        taps_raw = np.frombuffer(mm[off:off + n_tap_bytes], dtype=np.uint16).copy()
         off += n_tap_bytes
-        # BF16 → F32: upper 16 bits of F32
-        taps_f32 = (taps_raw.astype(np.uint32) << 16).view(np.float32)
-        taps_list.append(taps_f32.reshape(n_tokens, n_taps, n_embd))
+        # View the raw bytes as BF16 directly (bit-level reinterpret, lossless)
+        taps_bf16 = torch.from_numpy(taps_raw).view(torch.bfloat16)
+        taps_list.append(taps_bf16.reshape(n_tokens, n_taps, n_embd))
         tokens_list.append(tokens)
 
     tokens = np.concatenate(tokens_list)
-    taps = np.concatenate(taps_list)
+    taps = torch.cat(taps_list)  # [N, 5, 2560] bf16
     meta = {"n_taps": n_taps, "n_embd": n_embd, "n_tokens": len(tokens)}
     return tokens, taps, meta
 
@@ -126,8 +133,12 @@ def load_drafter(model_path: Path, config) -> DFlash2DraftModel:
     if unexpected:
         raise ValueError(f"Unexpected tensors: {unexpected}")
 
+    # The checkpoint is BF16; the model was constructed in F32, so copy_ above
+    # upcast every weight. Cast back to BF16 — the whole forward must run in
+    # BF16 (an F32 model would upcast the frozen 2.5 GB target head per sample).
+    model = model.to(torch.bfloat16)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Loaded drafter: {len(keys)} tensors, {n_params:,} params")
+    print(f"Loaded drafter: {len(keys)} tensors, {n_params:,} params (bf16)")
     return model
 
 
@@ -189,7 +200,12 @@ class _RoPEBatchWrapper(nn.Module):
     def forward(self, hidden_states, position_ids):
         cos, sin = self.inner(hidden_states, position_ids)
         bsz = hidden_states.shape[0]
-        return cos.unsqueeze(0).expand(bsz, -1, -1), sin.unsqueeze(0).expand(bsz, -1, -1)
+        # transformers 5.12.x returns [batch, seq, dim]; earlier 5.x returned
+        # [seq, dim]. Normalize to [batch, seq, dim] either way.
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(0).expand(bsz, -1, -1)
+            sin = sin.unsqueeze(0).expand(bsz, -1, -1)
+        return cos, sin
 
 
 class DFlash2Trainer(nn.Module):
@@ -211,47 +227,56 @@ class DFlash2Trainer(nn.Module):
         self.mask_token_id = config.dflash_config["mask_token_id"]
         self.block_size = config.dflash_config["block_size"]  # 8
 
-    def forward(self, context_taps: torch.Tensor, anchor_id: torch.Tensor,
+    def forward(self, context_taps: torch.Tensor, anchor_ids: torch.Tensor,
                 target_ids: torch.Tensor) -> torch.Tensor:
-        """Compute 7-position logits.
+        """Compute 7-position logits for a batch of samples.
 
         Args:
-            context_taps: [W, 5, 2560] — the context window's 5-layer taps
-            anchor_id: scalar int — the last committed token id
-            target_ids: [7] int — the 7 target token ids (for loss; not used in forward)
+            context_taps: [B, W, 5, 2560] — per-sample context windows
+            anchor_ids: [B] — per-sample last committed token id
+            target_ids: [B, 7] — target token ids (for loss; not used in forward)
 
         Returns:
-            logits: [7, vocab_size]
+            logits: [B, 7, vocab_size]
+
+        The drafter's forward is fully batch-compatible: fc + norm, the 5
+        decoder layers (SDPA attention with a [1,1,q,k] causal mask, dynamic
+        conv, MLP) and RoPE all broadcast over the batch dim, so one call
+        processes all B samples (no per-sample Python loop).
         """
-        W = context_taps.shape[0]
+        B, W = context_taps.shape[0], context_taps.shape[1]
         device = context_taps.device
 
-        # 1. Concatenate context taps: [W, 5, 2560] → [W, 12800]
+        # 1. Concatenate context taps: [B, W, 5, 2560] → [B, W, 12800]
         #    The drafter.forward() applies fc + hidden_norm internally.
-        context_concat = context_taps.reshape(W, -1)  # [W, 12800]
+        context_concat = context_taps.reshape(B, W, -1)  # [B, W, 12800]
 
-        # 2. Build the block embedding: [anchor, mask, mask, ..., mask] → [8, 2560]
-        block_ids = torch.full((self.block_size,), self.mask_token_id,
+        # 2. Build the block embeddings: [B, 8] ids (anchor + 7 masks) → [B, 8, 2560]
+        block_ids = torch.full((B, self.block_size), self.mask_token_id,
                                dtype=torch.long, device=device)
-        block_ids[0] = anchor_id
-        noise_embedding = F.embedding(block_ids, self.target_embed)  # [8, 2560]
+        block_ids[:, 0] = anchor_ids
+        noise_embedding = F.embedding(block_ids, self.target_embed)  # [B, 8, 2560]
 
-        # 3. Position ids for the full sequence (context + block)
-        position_ids = torch.arange(W + self.block_size, device=device)
+        # 3. Position ids for the full sequence (context + block).
+        #    Every sample starts at position 0 → identical rows, [B, W+block].
+        #    2D [batch, seq] — transformers 5.12.x RoPE expects that shape.
+        position_ids = torch.arange(W + self.block_size, device=device) \
+            .unsqueeze(0).expand(B, -1)
 
-        # 4. Forward through the drafter (5 layers)
-        #    target_hidden is the raw concat [W, 12800]; fc + norm applied inside
+        # 4. Forward through the drafter (5 layers), batched
+        #    target_hidden is the raw concat [B, W, 12800]; fc + norm inside
         hidden = self.drafter(
             position_ids=position_ids,
-            noise_embedding=noise_embedding.unsqueeze(0),  # [1, 8, 2560]
-            target_hidden=context_concat.unsqueeze(0),      # [1, W, 12800]
-        )  # [1, 8, 2560]
+            noise_embedding=noise_embedding,     # [B, 8, 2560]
+            target_hidden=context_concat,         # [B, W, 12800]
+        )  # [B, 8, 2560]
 
         # 5. Take the 7 draft positions (drop the anchor at position 0)
-        draft_hidden = hidden[0, 1:self.block_size, :]  # [7, 2560]
+        draft_hidden = hidden[:, 1:self.block_size, :]  # [B, 7, 2560]
 
-        # 6. Apply the frozen target head (it's a raw weight matrix, not a module)
-        logits = F.linear(draft_hidden, self.target_head.to(draft_hidden.dtype))  # [7, 248320]
+        # 6. Apply the frozen target head (it's a raw weight matrix, not a module).
+        #    Both sides are BF16, so .to() is a no-op — no per-sample F32 copy.
+        logits = F.linear(draft_hidden, self.target_head.to(draft_hidden.dtype))  # [B, 7, vocab]
 
         return logits
 
@@ -298,11 +323,19 @@ class TapDataset(Dataset):
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """Collate a batch of samples (all have the same context window size)."""
+    """Collate a batch of samples (all have the same context window size).
+
+    context_taps may be GPU-resident tensors (taps preloaded to the device) or
+    CPU numpy arrays (dry-run synthetic); stack accordingly so no per-batch
+    CPU->GPU copy is needed in the GPU-resident case. Taps stay BF16.
+    """
+    ctx = [s["context_taps"] for s in batch]
+    if torch.is_tensor(ctx[0]):
+        context_taps = torch.stack(ctx)  # [B, W, 5, 2560] on the taps' device
+    else:
+        context_taps = torch.from_numpy(np.stack(ctx)).to(torch.bfloat16)
     return {
-        "context_taps": torch.from_numpy(
-            np.stack([s["context_taps"] for s in batch])
-        ).float(),  # [B, W, 5, 2560]
+        "context_taps": context_taps,
         "anchor": torch.tensor([s["anchor"] for s in batch], dtype=torch.long),  # [B]
         "target": torch.from_numpy(
             np.stack([s["target"] for s in batch])
@@ -316,20 +349,21 @@ def collate_fn(batch: list[dict]) -> dict:
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     # --- Load config ---
-    config = load_fn_config(CONFIG_JSON)
+    checkpoint_dir = Path(args.checkpoint)
+    config = load_fn_config(checkpoint_dir / "config.json")
     assert_config_invariants(config)
     print(f"Config: hidden={config.hidden_size}, layers={config.num_hidden_layers}, "
-          f"vocab={config.vocab_size}")
+          f"vocab={config.vocab_size}", flush=True)
 
-    # --- Load model ---
-    drafter = load_drafter(MODEL_SAFETENSORS, config)
+    # --- Load model (BF16 end-to-end; the checkpoint is BF16) ---
+    drafter = load_drafter(checkpoint_dir / "model.safetensors", config)
     drafter = drafter.to(device)
 
-    # --- Load frozen target embed + head ---
-    target_embed, target_head = load_target_embed_head(TARGET_EMBED_HEAD, device)
+    # --- Load frozen target embed + head (BF16, frozen) ---
+    target_embed, target_head = load_target_embed_head(args.target_head, device)
 
     # --- Build trainer ---
     trainer = DFlash2Trainer(drafter, target_embed, target_head, config).to(device)
@@ -338,17 +372,30 @@ def train(args: argparse.Namespace) -> None:
     block_size = config.dflash_config["block_size"]  # 8
 
     # --- Load data ---
-    if args.dry_run and not TAPS_FILE.exists():
+    taps_path = Path(args.taps)
+    if args.dry_run and not taps_path.exists():
         # Generate synthetic taps for the CPU dry-run (verifies the loop, not real data)
-        print(f"Taps file not found ({TAPS_FILE}) — generating synthetic data for dry-run")
+        print(f"Taps file not found ({taps_path}) — generating synthetic data for dry-run")
         n_syn = window + block_size + 10
         tokens = np.random.randint(0, 248077, size=n_syn, dtype=np.int32)
-        taps = np.random.randn(n_syn, 5, 2560).astype(np.float32) * 0.1
+        taps = torch.randn(n_syn, 5, 2560).to(torch.bfloat16) * 0.1
         meta = {"n_taps": 5, "n_embd": 2560, "n_tokens": n_syn, "synthetic": True}
     else:
-        print(f"Loading taps from {TAPS_FILE}...")
-        tokens, taps, meta = load_taps_file(TAPS_FILE)
-        print(f"  tokens: {tokens.shape}, taps: {taps.shape}")
+        print(f"Loading taps from {taps_path}...", flush=True)
+        tokens, taps, meta = load_taps_file(taps_path)
+        print(f"  tokens: {tokens.shape}, taps: {tuple(taps.shape)} {str(taps.dtype)}", flush=True)
+
+    # --- Corpus manifest (validation only; the tokens live in the taps file) ---
+    if args.corpus and Path(args.corpus).exists():
+        import json as _json
+        with open(args.corpus) as f:
+            manifest = _json.load(f)
+        mt = manifest.get("total_tokens")
+        if mt is not None and mt != len(tokens):
+            print(f"  WARNING: manifest total_tokens={mt} != taps tokens={len(tokens)}")
+        else:
+            print(f"  corpus: {Path(args.corpus).name} ({manifest.get('num_prompts')} prompts, "
+                  f"{mt} tokens) — matches taps")
 
     if args.dry_run and not meta.get("synthetic", False):
         # Small subset for CPU dry-run
@@ -359,11 +406,21 @@ def train(args: argparse.Namespace) -> None:
         print(f"  Dry-run: using {n_max} tokens, window={window}")
 
     dataset = TapDataset(tokens, taps, window=window, block_size=block_size)
-    print(f"Dataset: {len(dataset)} samples (window={window}, block={block_size})")
+    print(f"Dataset: {len(dataset)} samples (window={window}, block={block_size})", flush=True)
 
     if len(dataset) == 0:
         print("ERROR: no training samples (not enough tokens for the window)")
         sys.exit(1)
+
+    if not args.dry_run and device.type == "cuda":
+        # Preload the taps to the GPU once. They are already BF16 (their on-file
+        # dtype), so this is lossless. Keeping the context BF16 keeps the whole
+        # forward in BF16 — a float32 context would upcast the frozen 2.5 GB
+        # target head to float32 on every sample in the batch loop (2.5 GB x 32)
+        # and OOM. GPU-resident slices also avoid any per-batch CPU->GPU copy.
+        dataset.taps = dataset.taps.to(device)
+        print(f"  taps on {device}: {tuple(dataset.taps.shape)} "
+              f"({dataset.taps.numel() * 2 / 1e9:.2f} GB, bf16)", flush=True)
 
     # For dry-run, limit to a few samples
     if args.dry_run:
@@ -401,33 +458,30 @@ def train(args: argparse.Namespace) -> None:
     trainer.train()
     step = 0
     total_steps = len(loader) * args.epochs
+    if args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
     t0 = time.perf_counter()
 
     for epoch in range(args.epochs):
-        epoch_loss = 0.0
+        epoch_loss_t = torch.zeros((), device=device)  # accumulate on-device; no per-step sync
+        epoch_steps = 0
         for batch in loader:
             context_taps = batch["context_taps"].to(device)  # [B, W, 5, 2560]
             anchor = batch["anchor"].to(device)             # [B]
             target = batch["target"].to(device)             # [B, 7]
 
-            # Process each sample in the batch (batch dim is outer)
-            # For efficiency on GPU, we process the whole batch; on CPU dry-run
-            # the batch is tiny.
-            B = context_taps.shape[0]
-            all_logits = []
-            for b in range(B):
-                logits_b = trainer(
-                    context_taps[b],  # [W, 5, 2560]
-                    anchor[b],        # scalar
-                    target[b],        # [7] (not used in forward, just carried)
-                )
-                all_logits.append(logits_b)
-            logits = torch.stack(all_logits)  # [B, 7, vocab]
+            # One batched forward: the drafter's 5-layer forward is fully
+            # batch-compatible (linears, SDPA, RoPE, dynamic conv all broadcast
+            # over B), so all B samples run in a single pass — no per-sample
+            # Python loop, no GPU idle time between launches.
+            logits = trainer(context_taps, anchor, target)  # [B, 7, vocab]
 
-            # Cross-entropy loss
+            # Cross-entropy loss in F32 (numerical stability: a log-softmax over
+            # a 248K vocab in BF16 loses too much precision). The forward stays
+            # BF16 end-to-end; only the logits are upcast for the loss.
             loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),  # [B*7, vocab]
-                target.reshape(-1),                    # [B*7]
+                logits.float().reshape(-1, logits.shape[-1]),  # [B*7, vocab] f32
+                target.reshape(-1),                            # [B*7]
             )
 
             optimizer.zero_grad()
@@ -437,27 +491,47 @@ def train(args: argparse.Namespace) -> None:
                 torch.nn.utils.clip_grad_norm_(drafter.parameters(), args.grad_clip)
 
             optimizer.step()
-            epoch_loss += loss.item()
+            epoch_loss_t += loss.detach()
+            epoch_steps += 1
             step += 1
 
             if step % args.log_every == 0 or (args.dry_run and step <= 3):
                 elapsed = time.perf_counter() - t0
-                lr_now = optimizer.param_groups[0]["lr"]
+                rate = step / elapsed if elapsed > 0 else 0.0
+                eta = (total_steps - step) / rate if rate > 0 else 0.0
+                gpu_gb = torch.cuda.memory_allocated(device) / 1e9 \
+                    if device.type == "cuda" else 0.0
                 print(f"  step {step}/{total_steps} | loss={loss.item():.4f} | "
-                      f"lr={lr_now:.2e} | {elapsed:.1f}s")
+                      f"{1000.0 / rate:.0f} ms/step | ETA={eta / 60:.1f}min | GPU={gpu_gb:.1f}GB",
+                      flush=True)
 
-        avg_loss = epoch_loss / max(1, len(loader))
-        print(f"  epoch {epoch+1}/{args.epochs} | avg_loss={avg_loss:.4f}")
+            if args.max_steps > 0 and step >= args.max_steps:
+                break
+
+        avg_loss = (epoch_loss_t / max(1, epoch_steps)).item()
+        print(f"  epoch {epoch+1}/{args.epochs} | avg_loss={avg_loss:.4f} "
+              f"({epoch_steps} steps)", flush=True)
+        if args.max_steps > 0 and step >= args.max_steps:
+            break
 
     total_time = time.perf_counter() - t0
-    print(f"\nDone. {step} steps in {total_time:.1f}s")
+    print(f"\nDone. {step} steps in {total_time:.1f}s", flush=True)
 
     # --- Save (if not dry-run) ---
     if not args.dry_run:
         out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        save_drafter(drafter, out_path)
-        print(f"Saved to {out_path}")
+        if out_path.suffix == ".safetensors":
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            save_drafter(drafter, out_path)
+        else:
+            # Directory output: model.safetensors + config.json (drop-in checkpoint dir)
+            out_path.mkdir(parents=True, exist_ok=True)
+            save_drafter(drafter, out_path / "model.safetensors")
+            import shutil
+            cfg_src = checkpoint_dir / "config.json"
+            if cfg_src.exists():
+                shutil.copy2(cfg_src, out_path / "config.json")
+        print(f"Saved to {out_path}", flush=True)
 
 
 def save_drafter(model: DFlash2DraftModel, path: Path) -> None:
@@ -472,14 +546,15 @@ def save_drafter(model: DFlash2DraftModel, path: Path) -> None:
         state[st_name] = param.data.contiguous()
 
     save_file(state, str(path))
-    print(f"  {len(state)} tensors saved")
+    print(f"  {len(state)} tensors saved", flush=True)
 
 
 # ---------------------------------------------------------------------------
 # Dry-run test
 # ---------------------------------------------------------------------------
 
-def dry_run() -> None:
+def dry_run(checkpoint: str = str(Path(MODEL_SAFETENSORS).parent),
+            target_head: str = str(TARGET_EMBED_HEAD)) -> None:
     """Quick CPU test: load model + head, run 3 training steps, print loss."""
     print("=" * 60)
     print("DRY-RUN: DFlash2 retrain (CPU, small tensors)")
@@ -495,6 +570,11 @@ def dry_run() -> None:
         grad_clip=1.0,
         window=64,
         log_every=1,
+        max_steps=0,
+        taps=str(TAPS_FILE),
+        corpus="",
+        checkpoint=checkpoint,
+        target_head=target_head,
         output="/tmp/dflash2-dryrun.safetensors",
     )
     train(args)
@@ -512,9 +592,9 @@ def main():
     parser = argparse.ArgumentParser(description="DFlash2 retrain")
     parser.add_argument("--dry-run", action="store_true",
                         help="Quick CPU test (small context, 3 steps)")
-    parser.add_argument("--device", default="cuda:1",
-                        help="Torch device (default: cuda:1)")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--device", default="cuda:0",
+                        help="Torch device (default: cuda:0; set CUDA_VISIBLE_DEVICES for the physical GPU)")
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="Learning rate (codebooks get 0.1× this)")
@@ -522,12 +602,22 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--window", type=int, default=2048,
                         help="Context window size (default: 2048 = sliding_window)")
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--taps", default=str(TAPS_FILE),
+                        help="Taps file (binary TAPS v1, BF16)")
+    parser.add_argument("--corpus", default="",
+                        help="Corpus manifest JSON (validation only)")
+    parser.add_argument("--checkpoint", default=str(Path(MODEL_SAFETENSORS).parent),
+                        help="Drafter checkpoint dir (model.safetensors + config.json)")
+    parser.add_argument("--target-head", default=str(TARGET_EMBED_HEAD),
+                        help="Frozen target embed+head safetensors")
+    parser.add_argument("--log-every", type=int, default=5)
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Stop after N steps (0 = run full epochs; for quick tests)")
     parser.add_argument("--output", default="/home/kv/work/basalt-dflash2/retrain/output/model.safetensors")
     args = parser.parse_args()
 
     if args.dry_run:
-        dry_run()
+        dry_run(args.checkpoint, args.target_head)
     else:
         train(args)
 
