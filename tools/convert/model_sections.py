@@ -543,6 +543,11 @@ class DFlash2:
             t = self.tensors[name]
             shape = t["shape"]
             raw = self._tensor_bytes(name)
+            # guard (S1): the source must be BF16/F16 and the byte count must match 2*prod(shape)
+            if t["dtype"] not in ("BF16", "F16"):
+                raise ConvertError(f"dflash2: {name} dtype {t['dtype']} (expected BF16/F16)")
+            if len(raw) != 2 * int(np.prod(shape)):
+                raise ConvertError(f"dflash2: {name} bytes {len(raw)} != 2*prod(shape)={2 * int(np.prod(shape))}")
             if len(shape) == 1:
                 # norm weights: BF16 -> F32 (no +1; the source is already in gain form)
                 f32 = (raw.view("<u2").astype(np.uint32) << 16).view(np.float32).astype(np.float32)
@@ -570,16 +575,26 @@ class DFlash2:
             for b in iter(lambda: f.read(1 << 24), b""):
                 st_sha.update(b)
         cfg_sha = hashlib.sha256((self.src / "config.json").read_bytes()).hexdigest()
+        dflash_cfg = self.config.get("dflash_config", {})
         return {
             "source": self.src.name,
             "model_sha256": st_sha.hexdigest(),
             "config_sha256": cfg_sha,
             "n_layers": self.config.get("num_hidden_layers", 0),
             "hidden_size": self.config.get("hidden_size", 0),
-            "block_size": self.config.get("dflash_config", {}).get("block_size", 0),
-            "target_layer_ids": self.config.get("dflash_config", {}).get("target_layer_ids", []),
             "n_tensors": len(self.tensors),
             "dense_bytes": self.dense_bytes,
+            # full geometry the loader needs (S2):
+            "dflash_config": dflash_cfg,
+            "head_dim": self.config.get("head_dim"),
+            "num_attention_heads": self.config.get("num_attention_heads"),
+            "num_key_value_heads": self.config.get("num_key_value_heads"),
+            "intermediate_size": self.config.get("intermediate_size"),
+            "vocab_size": self.config.get("vocab_size"),
+            "max_position_embeddings": self.config.get("max_position_embeddings"),
+            "rms_norm_eps": self.config.get("rms_norm_eps"),
+            "rope_theta": self.config.get("rope_theta"),
+            "layer_types": self.config.get("layer_types"),
         }
 
 

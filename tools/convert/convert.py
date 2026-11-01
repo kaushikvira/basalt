@@ -13,6 +13,7 @@ Inputs
                      byte (BASE's vocabulary must be the GGUF's); replaces --mmproj, --mtp-*, --draft-vocab, --profile*, --hc8
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
+  --dflash2-source DIR  the DFlash2 block-diffusion drafter (model.safetensors + config.json); emits dflash2/* sections
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
                      with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
                      With --sections-from and --checkpoint it replaces the mtp/dense copied from BASE (same size required)
@@ -274,7 +275,7 @@ def convert(a) -> None:
             copied = []
             if base is not None:
                 for name in base.names():
-                    if name != "vision/text_vocab" and (name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8")):
+                    if name != "vision/text_vocab" and (name.startswith(("mtp/", "vision/", "dflash2/")) or name in ("profile", "hc8")):
                         off, size = base.section(name)
                         job.file(name, a.sections_from, off, size)
                         if w.entries[-1][3] != base.sections[name][2]:
@@ -433,7 +434,7 @@ def from_checkpoint(a) -> None:
             tensor_offsets = dict(zip(names, offs))
             tuned_sha = None
             for name in base.names():
-                if name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8"):
+                if name.startswith(("mtp/", "vision/", "dflash2/")) or name in ("profile", "hc8"):
                     off, size = base.section(name)
                     if name == "mtp/dense" and a.mtp_dense:
                         tuned = Path(a.mtp_dense)
@@ -448,7 +449,7 @@ def from_checkpoint(a) -> None:
                         continue
                     job.file(name, src, off, size)
             for name, _, _, digest in w.entries:
-                if name in base.sections and name.startswith(("mtp/", "vision/", "profile", "hc8")) \
+                if name in base.sections and name.startswith(("mtp/", "vision/", "dflash2/", "profile", "hc8")) \
                         and not (name == "mtp/dense" and a.mtp_dense) \
                         and digest != base.sections[name][2]:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
@@ -486,7 +487,7 @@ def from_checkpoint(a) -> None:
                           "transforms": {k: C.METHODS[k] for k in used}},
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
-                                  "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/")) or
+                                  "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/", "dflash2/")) or
                                              n in ("profile", "hc8")]}}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()

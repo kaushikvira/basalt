@@ -86,13 +86,39 @@ class ConvertTest(unittest.TestCase):
     def args(self, **kw):
         t = self.t
         d = dict(gguf=[str(self.gguf)], mmproj=str(t / "mmproj.gguf"), out=str(t / "out.basalt"), mtp_source=None, mtp_dense=None,
-                 draft_vocab=None, profile=None, profile_from=None, hc8=str(t / "hc8.bin"), name="Tiny",
+                 dflash2_source=None, draft_vocab=None, profile=None, profile_from=None, hc8=str(t / "hc8.bin"), name="Tiny",
                  compat_bf16=False, no_vision=False, force=False, sections_from=None)
         d.update(kw)
         return type("A", (), d)()
 
     def model(self):
         return ModelFile(str(self.t / "out.basalt"))
+
+    def test_dflash2(self):
+        # S4: a synthetic dflash2 dir (tiny BF16 tensors + a config) -> sections + index + meta.
+        import struct
+        d = self.t / "dflash2"; d.mkdir()
+        tensors = {"fc.weight": [4, 8], "norm": [4]}
+        header = {"__metadata__": {}}
+        off, blobs = 0, []
+        for name, shape in tensors.items():
+            data = np.zeros(int(np.prod(shape)), dtype=np.uint16).tobytes()
+            header[name] = {"dtype": "BF16", "shape": shape, "data_offsets": [off, off + len(data)]}
+            off += len(data); blobs.append(data)
+        hdr = json.dumps(header).encode()
+        with open(d / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hdr))); f.write(hdr); f.write(b"".join(blobs))
+        (d / "config.json").write_text(json.dumps(
+            {"num_hidden_layers": 2, "hidden_size": 4, "head_dim": 4,
+             "dflash_config": {"block_size": 4, "target_layer_ids": [0, 1]}}))
+        comp = S.DFlash2(str(d))
+        pool = b"".join(comp.dense_chunks())
+        self.assertGreater(len(pool), 0)
+        idx = comp.dense_index().decode()
+        self.assertIn("fc.weight bf16 4 8", idx)
+        meta = comp.provenance()
+        self.assertEqual(meta["n_tensors"], 2)
+        self.assertIn("dflash_config", meta)  # S2: geometry embedded
 
     # ---------------------------------------------------------------- sections
     def test_sections(self):
