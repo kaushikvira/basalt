@@ -229,16 +229,26 @@ uint64_t DFlash2Drafter::activations_bytes(const DFlash2Geometry& g) {
     const uint64_t q = (uint64_t) g.q_width();
     const uint64_t kv = (uint64_t) g.kv_width();
     const uint64_t inter = (uint64_t) g.intermediate_size;
-    const uint64_t conv = (uint64_t) (h / (uint64_t) g.conv_group_size) * 2u * (uint64_t) g.conv_kernel_size;
-    // per layer (bf16): the input, q, k, v, the attention out, the MLP in / intermediate / out, the two conv outputs
-    const uint64_t per_layer = B * (h + q + 2u * kv + h + inter + h + 2u * conv);
-    const uint64_t layers = per_layer * (uint64_t) g.n_layers;
-    // the selector: the block's projected rows (rank, bf16) + the top-k candidates' scores (fp32)
-    const uint64_t selector = B * ((uint64_t) g.selector_rank * 2u + (uint64_t) g.selector_top_k * 4u);
-    // fp32 working: the block's normalized rows + the attention scores
-    const uint64_t fp32 = B * (h * 4u + q * 4u);
-    // a 4 MiB headroom for the forward's scratch (the exact buffers are the next sub-task), 256-aligned
-    return (layers + selector + fp32 + (4u << 20) + 255) & ~255ull;
+    const uint64_t G = h / (uint64_t) g.conv_group_size;
+    const uint64_t conv4 = 4u * G;   // the kernel projection's rows (the four tap deltas)
+    const uint64_t conv2 = 2u * G;   // the output conv's deltas
+    // the block's working set (bf16, one set - the 5 layers stream through the same buffers):
+    // the residual, the normalized, the conv input, q, k, v, the attention out, the MLP gate/up/intermediate,
+    // the MLP out, the kernel projection, the conv deltas
+    const uint64_t block = B * (h + h + h + q + kv + kv + q + inter + inter + inter + h + conv4 + conv2 +
+                                h + conv4 + conv2);   // the MLP branch's conv prepare
+    // the context append (chunked to 512 rows): the fc input (the tapped features), the features, the K, the V
+    const uint64_t ctx = 512u * ((uint64_t) g.target_layer_ids.size() * h + h + 2u * kv);
+    // the selector: the logits (K rows x the vocab), the hidden rows (K x rank), the top-k partials (two
+    // ping-pong buffers of the V/1024 chunks x K x top_k, ids + scores)
+    const uint64_t K = B - 1;
+    const uint64_t chunks = ((uint64_t) g.vocab_size + 1023u) / 1024u;
+    const uint64_t selector = K * ((uint64_t) g.vocab_size + (uint64_t) g.selector_rank) * 2u +
+                              2u * chunks * K * (uint64_t) g.selector_top_k * 8u;
+    // fp32 working: the embedding's gather scratch + the candidates' scores
+    const uint64_t fp32 = B * h * 4u + K * (uint64_t) g.selector_top_k * 4u;
+    // 16 MiB headroom for the forward's scratch, 256-aligned
+    return (block + ctx + selector + fp32 + (16u << 20) + 255) & ~255ull;
 }
 
 bool DFlash2Drafter::plan_bytes(const DFlash2Files& files, const DFlash2Geometry& g, uint64_t& out, std::string& err) {
@@ -318,26 +328,7 @@ bool DFlash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const f
 }
 
 // ================================ the stubs ================================
-
-bool DFlash2Drafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                           float* probs, int* n_drafts) {
-    (void) T;
-    (void) tokens;
-    (void) p;
-    (void) a;
-    (void) drafts;
-    (void) probs;
-    (void) err;
-    if (n_drafts) *n_drafts = 0;
-    // STUB: the block-diffusion forward (the 5 layers + the selector) is the next sub-task.
-    return true;
-}
-
-bool DFlash2Drafter::prewarm(std::string& err) {
-    (void) err;
-    // STUB: the draft graphs come with the forward (the next sub-task).
-    return true;
-}
+// the block-diffusion forward (draft / prewarm / append_context) is forward.cpp's.
 
 bool DFlash2Drafter::idle(std::string& err) {
     if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "dflash2: its stream failed"; return false; }
@@ -348,6 +339,9 @@ DFlash2Drafter::~DFlash2Drafter() {
     if (cs_) cudaStreamSynchronize(cs_);
     if (ev_done_) cudaEventDestroy(ev_done_);
     if (cs_) cudaStreamDestroy(cs_);
+    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+    if (graph_) cudaGraphDestroy(graph_);
+    if (n_drafts_pin_) cudaFreeHost(n_drafts_pin_);
     if (dense_) cudaFree(dense_);
     if (kv_arena_) cudaFree(kv_arena_);
     if (arena_) cudaFree(arena_);

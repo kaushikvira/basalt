@@ -325,6 +325,8 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/mtp/stores.cpp
   src/core/mtp/batching.cpp
   src/core/dflash2/loader.cpp
+  src/core/dflash2/forward.cpp
+  src/core/dflash2/forward.cu
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
@@ -342,6 +344,18 @@ if(BUILD_TESTING)
   basalt_embed_manifest(direct_upload_test)
   basalt_gpu_test(NAME direct_upload_test COMMAND direct_upload_test)
   set_tests_properties(direct_upload_test PROPERTIES TIMEOUT 60)
+endif()
+# the DFlash2 block-diffusion forward against the NumPy reference (the fixture is make_fixture.py's; the
+# test skips when the fixture is absent)
+if(BUILD_TESTING)
+  add_executable(dflash2_gate tests/dflash2/gate.cpp)
+  target_link_libraries(dflash2_gate PRIVATE engine)
+  basalt_gpu_test(NAME dflash2_gate COMMAND dflash2_gate ${CMAKE_BINARY_DIR}/dflash2-fixture
+                  $ENV{HOME}/models/basalt-swift/Swift-1.5-FN-NVFP4.basalt)
+  set_tests_properties(dflash2_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+  add_executable(dflash2_dbg tests/dflash2/dbg_fwd.cu)
+  target_link_libraries(dflash2_dbg PRIVATE engine)
+  target_include_directories(dflash2_dbg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 # the learned expert profile (--expert-profile-save): its order and file format (CPU only)
 if(BUILD_TESTING)

@@ -5,12 +5,12 @@
 // its own 5 layers (sliding-window attention, per-layer dynamic convs, a dense MLP), and a candidate
 // selector picks the block's tokens.  It keeps its own local cyclic K/V (one sliding window per layer).
 //
-// This is the SCAFFOLDING of the port: the interface, the C++ loader (the `dflash2/dense` pool + the
-// `dflash2/dense.index` + the geometry from `meta["dflash2"]`), the VRAM planning and the bind.  The
-// block-diffusion `draft()` forward is a STUB (it returns an empty block); the forward + kernels are the
-// next sub-task.  The structure mirrors `MtpDrafter` (mtp.hpp): the same contract (`load` / `plan_bytes` /
-// `bind` / `draft` / `done_event` / `prewarm`), the same lifecycle (host-side `load`, device-side `bind`),
-// the same VRAM accounting (`plan_bytes` before `bind`).
+// This is the port: the interface, the C++ loader (the `dflash2/dense` pool + the
+// `dflash2/dense.index` + the geometry from `meta["dflash2"]`), the VRAM planning and the bind, and the
+// block-diffusion `draft()` forward (the 5 layers + the selector, the CUDA kernels in forward.cu).  The
+// structure mirrors `MtpDrafter` (mtp.hpp): the same contract (`load` / `plan_bytes` / `bind` / `draft` /
+// `done_event` / `prewarm`), the same lifecycle (host-side `load`, device-side `bind`), the same VRAM
+// accounting (`plan_bytes` before `bind`).
 #pragma once
 
 #include "basalt/core/model_file.hpp"
@@ -136,13 +136,23 @@ public:
     /// lifecycle vs MTP.)
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
-    /// One draft round: the block-diffusion forward.  STUB - returns an empty block (the forward + kernels are
-    /// the next sub-task).  Mirrors MtpDrafter::draft's signature so the decode-loop integration is a drop-in.
+    /// One draft round: the block-diffusion forward (the anchor + K masks through the 5 layers, the greedy
+    /// selector walk).  `tokens` covers [p, p+T); the anchor is `tokens[a]` at position p+a; at most T-1
+    /// drafts come back in `drafts` (the count in `n_drafts` when set).  The target's embedding + head score
+    /// the block (the drafter reuses them, per NInfer's bind_draft).  After `prewarm`.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, int* n_drafts = nullptr);
 
-    /// Captures every draft graph now rather than at first use.  STUB - a no-op (the graphs come with the
-    /// forward).  After `bind`.
+    /// Append the verified target tokens (positions [pos0, pos0+n)) to the drafter's local cyclic K/V: the
+    /// feature projection over the tokens' hidden states, then each layer's K/V into the cyclic slots.  The
+    /// attention's visible prefix (the frontier) advances to pos0 + n.  The `features` are the tokens' hidden
+    /// states [n, h] F32 (the target's, the same rows the feature projection taps).  After `bind`; n <= 4096.
+    bool append_context(const float* features, int n, int64_t pos0, std::string& err);
+
+    /// The frontier (the first position NOT in the local K/V; the attention sees [0, frontier)).
+    int64_t frontier() const { return frontier_pos_; }
+
+    /// Captures the draft graph now rather than at first use.  After `bind`.
     bool prewarm(std::string& err);
 
     /// An event behind everything queued on the drafter's stream so far (a verify window on this card waits for
@@ -151,6 +161,13 @@ public:
         if (cs_ && ev_done_) cudaEventRecord(ev_done_, cs_);
         return ev_done_;
     }
+
+    /// The arena's slots by name (the gate test's reads): "residual", "logits", "hidden_full",
+    /// "hidden_r", "cand_ids", "cand_scores", "drafts". Null before prewarm.
+    const void* slot(const char* name) const;
+
+    /// The parsed geometry (after load).
+    const DFlash2Geometry& geom() const { return g_; }
 
     uint64_t vram_bytes() const { return vram_; }
     int device() const { return device_; }
@@ -186,6 +203,24 @@ private:
     std::vector<uint16_t*> kv_v_;          ///< [layer] V pool
     void* arena_ = nullptr;                ///< the block's working buffers
     uint64_t arena_bytes_ = 0;
+    cudaGraph_t graph_ = nullptr;          ///< the captured block forward
+    cudaGraphExec_t graph_exec_ = nullptr;  ///< the instantiated graph (the draft launches it)
+    int* n_drafts_pin_ = nullptr;          ///< the selector's count, pinned mapped (the graph writes it)
+    int64_t frontier_pos_ = 0;             ///< the first position not in the local K/V
+    // the arena's slots (carved in prewarm; the exact layout is forward.cpp's)
+    struct Work {
+        uint16_t *residual, *normalized, *prepared, *q, *k, *v, *attn, *gate, *up, *act, *mlp, *kproj, *fdelta;
+        uint16_t *prepared2, *kproj2, *fdelta2;  ///< the MLP branch's conv prepare
+        uint16_t *ctx, *ctx_k, *ctx_v;     ///< the context append (chunked to 512 rows)
+        uint16_t *ctx_x;                   ///< the append's fc input (512 x n_taps*h, bf16)
+        uint16_t *logits;                  ///< [K, vocab] bf16
+        uint16_t *hidden_full;             ///< [K, h] the pack tail
+        uint16_t *hidden_r;                ///< [K, rank] the selector's rows
+        float* embed_f32;                  ///< the embedding's gather scratch (W x h)
+        int* cand_ids; float* cand_scores; ///< the selector's [K, 16]
+        int* tk_ids[2]; float* tk_s[2];    ///< the top-k's partials (ping-pong)
+        int *pos, *ids, *frontier, *drafts_dev, *ctx_pos;
+    } wk_{};
 };
 
 }  // namespace basalt::core
