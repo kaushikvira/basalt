@@ -91,7 +91,7 @@ bool DFlash2Drafter::prewarm(std::string& err) {
     wk_.hidden_full = (uint16_t*) cv.take((uint64_t) K * (uint64_t) H * B2);
     wk_.hidden_r = (uint16_t*) cv.take((uint64_t) K * (uint64_t) R * B2);
     if (cv.left < (uint64_t) W * H * 4u + (uint64_t) K * 16u * 8u + 2u * (uint64_t) chunks * K * 16u * 8u +
-                      128u * 4u) {
+                      128u * 4u + 6u * 64u) {
         err = "dflash2: the working arena is too small for the forward's buffers";
         return false;
     }
@@ -107,6 +107,7 @@ bool DFlash2Drafter::prewarm(std::string& err) {
     wk_.frontier = (int*) cv.take(4u);
     wk_.drafts_dev = (int*) cv.take(64u * 4u);
     wk_.ctx_pos = (int*) cv.take(512u * 4u);
+    wk_.ptrs = cv.take(6u * 64u);   // the 64 B pointer slots: 5 x swa (per layer) + 1 x the walk
 
     if (cudaHostAlloc(&n_drafts_pin_, 4, cudaHostAllocDefault) != cudaSuccess) {
         err = "dflash2: the pinned draft count";
@@ -123,6 +124,14 @@ bool DFlash2Drafter::prewarm(std::string& err) {
     const auto* succ = cb16(w_.sel_succ.dev);
     const auto* fin = (const float*) w_.final_norm.dev;
     const auto* headw = (const uint8_t*) head_->weights();
+
+    // the pointer slots (the driver's 64 B parameter limit): written once here - the pointers are fixed
+    // for the drafter's lifetime, so the graph's kernels read the same slots at every replay
+    for (int l = 0; l < g.n_layers; ++l)
+        fk::swa_write_slot((uint8_t*) wk_.ptrs + (size_t) l * 64u, b16(wk_.q), b16(wk_.k), b16(wk_.v),
+                           cb16(kv_k_[(size_t) l]), cb16(kv_v_[(size_t) l]), wk_.pos, wk_.frontier, b16(wk_.attn));
+    fk::sel_write_slot((uint8_t*) wk_.ptrs + (size_t) g.n_layers * 64u, wk_.cand_ids, wk_.cand_scores,
+                       cb16(wk_.hidden_r), wk_.ids, pred, succ, wk_.drafts_dev, n_drafts_pin_);
 
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "dflash2: the graph capture began";
@@ -157,7 +166,7 @@ bool DFlash2Drafter::prewarm(std::string& err) {
                          (const float*) L.q_norm.dev, (const float*) L.k_norm.dev, g.rope_theta, g.rms_norm_eps, cs_);
         fk::swa(b16(wk_.q), b16(wk_.k), b16(wk_.v), wk_.pos, cb16(kv_k_[(size_t) l]), cb16(kv_v_[(size_t) l]), W,
                 g.num_attention_heads, g.num_key_value_heads, g.head_dim, g.sliding_window, wk_.frontier, scale,
-                b16(wk_.attn), cs_);
+                b16(wk_.attn), cs_, (uint8_t*) wk_.ptrs + (size_t) l * 64u);
         fk::gemm_bf16(cb16(L.o_proj.dev), b16(wk_.attn), b16(wk_.mlp), H, Q, W, cs_);
         fk::conv_out(b16(wk_.residual), b16(wk_.mlp), cb16(L.attn_conv_base.dev), b16(wk_.fdelta), W, H, G, cs_);
         // the MLP branch
@@ -207,7 +216,7 @@ bool DFlash2Drafter::prewarm(std::string& err) {
     }
     // 6: the greedy walk (the anchor from the device ids; the count to the pinned scalar)
     fk::selector_walk(wk_.cand_ids, wk_.cand_scores, cb16(wk_.hidden_r), wk_.ids, pred, succ, wk_.drafts_dev,
-                      n_drafts_pin_, K, R, cs_);
+                      n_drafts_pin_, K, R, cs_, (uint8_t*) wk_.ptrs + (size_t) g.n_layers * 64u);
     if (cudaStreamEndCapture(cs_, &graph_) != cudaSuccess) {
         err = "dflash2: the graph capture ended";
         graph_ = nullptr;

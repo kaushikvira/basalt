@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace basalt::core {
 namespace dflash2_detail {
@@ -502,34 +503,50 @@ void f32_to_bf16(const float* in, bf16* out, int64_t n, cudaStream_t s) {
 // column: 128 threads, warp w the q-heads 4w..4w+3 (lane l the 4 dims 4l..4l+3 of each head), online softmax
 // in FP32, the block's K/V last (every block key is within the window of every block query).
 
-struct SwaArgs {
-    const bf16* q, *kb, *vb, *kc, *vc;
+// The pointers cross in device slots, not the kernel params: the driver (615.71.09) corrupts the
+// constant bank of any kernel whose parameter buffer exceeds 64 B (2026-11-01, the 88 B args below read a
+// stale driver pointer in place of the real one).  One 64 B slot per swa call + one for the walk, written
+// before the graph capture (the pointers are fixed for the drafter's lifetime, so the graph needs no
+// staging nodes); the kernels' own params stay 32 B / 16 B.
+struct SwaPtrs {
+    const bf16* q;
+    const bf16* kb;
+    const bf16* vb;
+    const bf16* kc;
+    const bf16* vc;
     const int* pos;
     const int* frontier_dev;   // the visible prefix (device: the graph bakes the pointers, not the values)
-    int W, NHq, NHk, D, window;
-    float scale;
     bf16* out;
 };
 
-__global__ void __launch_bounds__(256) swa_body(SwaArgs a) {
+__global__ void __launch_bounds__(256) swa_body(const SwaPtrs* __restrict__ ptrs, int W, int NHq, int NHk,
+                                                int D, int window, float scale) {
+    const bf16* __restrict__ q = ptrs->q;
+    const bf16* __restrict__ kb = ptrs->kb;
+    const bf16* __restrict__ vb = ptrs->vb;
+    const bf16* __restrict__ kc = ptrs->kc;
+    const bf16* __restrict__ vc = ptrs->vc;
+    const int* __restrict__ pos = ptrs->pos;
+    const int* __restrict__ frontier_dev = ptrs->frontier_dev;
+    bf16* __restrict__ out = ptrs->out;
     const int i = static_cast<int>(blockIdx.x);
-    const int pi = a.pos[i];
-    const int frontier = *a.frontier_dev;
+    const int pi = pos[i];
+    const int frontier = *frontier_dev;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int hq0 = warp * 4;
-    const int hk = hq0 / (a.NHq / a.NHk);
+    const int hk = hq0 / (NHq / NHk);
     const int d0 = lane * 4;
     __shared__ float score[8][4];
     float qv[4][4];
-    const bf16* qr = a.q + static_cast<int64_t>(i) * a.NHq * a.D + hq0 * a.D + d0;
+    const bf16* qr = q + static_cast<int64_t>(i) * NHq * D + hq0 * D + d0;
 #pragma unroll
     for (int h = 0; h < 4; ++h)
 #pragma unroll
-        for (int d = 0; d < 4; ++d) qv[h][d] = __bfloat162float(qr[h * a.D + d]);
+        for (int d = 0; d < 4; ++d) qv[h][d] = __bfloat162float(qr[h * D + d]);
     float m[4] = {}, l[4] = {}, acc[4][4] = {};
     auto key = [&](int p, bool block) {
-        const int slot = block ? (p - a.pos[0]) : (p & (a.window - 1));
-        const bf16* k = (block ? a.kb : a.kc) + (static_cast<int64_t>(slot) * a.NHk + hk) * a.D + d0;
+        const int slot = block ? (p - pos[0]) : (p & (window - 1));
+        const bf16* k = (block ? kb : kc) + (static_cast<int64_t>(slot) * NHk + hk) * D + d0;
         float s[4] = {};
 #pragma unroll
         for (int h = 0; h < 4; ++h) {
@@ -542,13 +559,13 @@ __global__ void __launch_bounds__(256) swa_body(SwaArgs a) {
         }
         if (lane == 0)
 #pragma unroll
-            for (int h = 0; h < 4; ++h) score[warp][h] = s[h] * a.scale;
+            for (int h = 0; h < 4; ++h) score[warp][h] = s[h] * scale;
         __syncthreads();
         const float s0 = score[warp][0], s1 = score[warp][1], s2 = score[warp][2], s3 = score[warp][3];
         const float mn = fmaxf(fmaxf(fmaxf(fmaxf(m[0], s0), fmaxf(m[1], s1)), fmaxf(m[2], s2)), s3);
         const float r0 = __expf(m[0] - mn), r1 = __expf(m[1] - mn), r2 = __expf(m[2] - mn), r3 = __expf(m[3] - mn);
         const float e0 = __expf(s0 - mn), e1 = __expf(s1 - mn), e2 = __expf(s2 - mn), e3 = __expf(s3 - mn);
-        const bf16* v = (block ? a.vb : a.vc) + (static_cast<int64_t>(slot) * a.NHk + hk) * a.D + d0;
+        const bf16* v = (block ? vb : vc) + (static_cast<int64_t>(slot) * NHk + hk) * D + d0;
 #pragma unroll
         for (int h = 0; h < 4; ++h) {
             const float r = h == 0 ? r0 : h == 1 ? r1 : h == 2 ? r2 : r3;
@@ -563,30 +580,40 @@ __global__ void __launch_bounds__(256) swa_body(SwaArgs a) {
         m[3] = mn;
         __syncthreads();
     };
-    const int lo = max(0, pi - a.window + 1);
+    const int lo = max(0, pi - window + 1);
     for (int p = lo; p < frontier; ++p) key(p, false);
-    for (int j = 0; j < a.W; ++j) key(a.pos[j], true);
-    bf16* o = a.out + static_cast<int64_t>(i) * a.NHq * a.D + hq0 * a.D + d0;
+    for (int j = 0; j < W; ++j) key(pos[j], true);
+    bf16* o = out + static_cast<int64_t>(i) * NHq * D + hq0 * D + d0;
 #pragma unroll
     for (int h = 0; h < 4; ++h) {
         const float inv = l[h] > 0.0f ? 1.0f / l[h] : 0.0f;
 #pragma unroll
-        for (int d = 0; d < 4; ++d) o[h * a.D + d] = __float2bfloat16_rn(acc[h][d] * inv);
+        for (int d = 0; d < 4; ++d) o[h * D + d] = __float2bfloat16_rn(acc[h][d] * inv);
     }
 }
 
+// ptrs_dev: this call's 64 B arena slot (written before the capture; the kernel reads it at every replay).
 void swa(const bf16* q, const bf16* kb, const bf16* vb, const int* pos, const bf16* kc, const bf16* vc,
                 int W, int NHq, int NHk, int D, int window, const int* frontier_dev, float scale, bf16* out,
-                cudaStream_t s) {
-    SwaArgs a{q, kb, vb, kc, vc, pos, frontier_dev, W, NHq, NHk, D, window, scale, out};
-    swa_body<<<W, 256, 0, s>>>(a);
+                cudaStream_t s, void* ptrs_dev) {
+    swa_body<<<W, 256, 0, s>>>((const SwaPtrs*) ptrs_dev, W, NHq, NHk, D, window, scale);
+}
+
+/// The synchronous slot write (the default stream; called once before the graph capture - the pointers are
+/// fixed for the drafter's lifetime).
+void swa_write_slot(void* slot, const bf16* q, const bf16* kb, const bf16* vb, const bf16* kc, const bf16* vc,
+                    const int* pos, const int* frontier_dev, bf16* out) {
+    SwaPtrs p{q, kb, vb, kc, vc, pos, frontier_dev, out};
+    if (cudaMemcpy(slot, &p, sizeof p, cudaMemcpyHostToDevice) != cudaSuccess)
+        std::abort();
 }
 
 // ================================ the top-k ================================
 //
 // Per column n of logits [N, V] BF16: the top-KT (id, score).  Pass 1: one CTA per (V/1024 chunk, column)
-// keeps its chunk's local top-KT (a shared sorted list, thread 0 inserts); pass 2: the tree merge of the
-// chunk lists (two sorted 16-lists -> one, per (pair, column)).
+// keeps its chunk's local top-KT (a shared sorted list, thread 0 inserts over the chunk's 1024 values,
+// staged in smem by the 256 threads); pass 2: the tree merge of the chunk lists (two sorted 16-lists ->
+// one, per (pair, column)).
 
 constexpr int kTopK = 16;
 constexpr float kNegInf = -3.4e38f;
@@ -596,16 +623,27 @@ __global__ void __launch_bounds__(256) topk_local_kernel(const bf16* __restrict_
     const int n = static_cast<int>(blockIdx.y);
     const int chunk = static_cast<int>(blockIdx.x);
     const bf16* row = logits + static_cast<int64_t>(n) * V + static_cast<int64_t>(chunk) * 1024;
+    const int valid = min(1024, V - chunk * 1024);   // the last chunk is partial (V % 1024)
     __shared__ float sv[kTopK];
     __shared__ int si[kTopK];
+    __shared__ float svals[1024];
     if (threadIdx.x < kTopK) {
-        sv[threadIdx.x] = -kNegInf;
+        sv[threadIdx.x] = kNegInf;   // the empty slots sort last (the insertion is `s > sv[j]`)
         si[threadIdx.x] = -1;
     }
+    // every value of the chunk must cross the top-k: the 256 threads stage the 1024 values (4 each;
+    // the partial tail of the last chunk is padded with -inf, not the next row's bytes), then thread 0
+    // walks the staged list into the sorted top-KT
+    const int v0 = 4 * threadIdx.x;
+    svals[v0 + 0] = (v0 + 0 < valid) ? __bfloat162float(row[v0 + 0]) : kNegInf;
+    svals[v0 + 1] = (v0 + 1 < valid) ? __bfloat162float(row[v0 + 1]) : kNegInf;
+    svals[v0 + 2] = (v0 + 2 < valid) ? __bfloat162float(row[v0 + 2]) : kNegInf;
+    svals[v0 + 3] = (v0 + 3 < valid) ? __bfloat162float(row[v0 + 3]) : kNegInf;
     __syncthreads();
-    for (int v = threadIdx.x * 4; v < 1024; v += 256) {
-        if (threadIdx.x == 0) {
-            const float s = __bfloat162float(row[v]);
+    if (threadIdx.x == 0) {
+#pragma unroll 4
+        for (int v = 0; v < valid; ++v) {
+            const float s = svals[v];
             const int id = chunk * 1024 + v;
             int j = kTopK - 1;
             if (s > sv[j]) {
@@ -648,8 +686,10 @@ __global__ void __launch_bounds__(256) topk_merge_kernel(const int* __restrict__
     const float* b_s = in_s + (static_cast<int64_t>(2 * c2 + 1) * N + n) * kTopK;
     int ia = 0, ib = 0;
     for (int step = 0; step <= slot; ++step) {
-        const float sa = ia < kTopK ? a_s[ia] : -kNegInf;
-        const float sb = ib < kTopK ? b_s[ib] : -kNegInf;
+        // the exhausted side shows -inf (it can never win the merge); at most one side is exhausted at
+        // step <= 15 (the two lists hold 32 entries together)
+        const float sa = ia < kTopK ? a_s[ia] : kNegInf;
+        const float sb = ib < kTopK ? b_s[ib] : kNegInf;
         if (sa >= sb && ia < kTopK) {
             o_i[slot] = a_i[ia];
             o_s[slot] = sa;
@@ -679,7 +719,9 @@ void topk_merge(const int* in_i, const float* in_s, int C, int N, int* out_i, fl
 // hidden[r, i] * succ_cb[r, cand[c, i]]; the draft is the lowest candidate rank attaining max(edge).
 // R = the selector rank (256).
 
-struct SelArgs {
+// The 72 B SelArgs crossed the driver's 64 B parameter limit (the same constant-bank bug as swa's);
+// the pointers ride a 64 B arena slot, the kernel's own params are 16 B.
+struct SelPtrs {
     const int* ids;        // [K, 16] the candidates (rank fastest)
     const float* unary;    // [K, 16]
     const bf16* hidden;    // [K, R]
@@ -688,8 +730,6 @@ struct SelArgs {
     const bf16* succ;      // [V, R]
     int* drafts;           // [K]
     int* n_drafts;
-    int steps;
-    int R;
 };
 
 struct alignas(16) SelShared {
@@ -699,39 +739,47 @@ struct alignas(16) SelShared {
     int predecessor;
 };
 
-__global__ void __launch_bounds__(512, 1) selector_walk_kernel(SelArgs a) {
+__global__ void __launch_bounds__(512, 1) selector_walk_kernel(const SelPtrs* __restrict__ ptrs, int steps, int R) {
+    const int* __restrict__ ids = ptrs->ids;
+    const float* __restrict__ unary = ptrs->unary;
+    const bf16* __restrict__ hidden = ptrs->hidden;
+    const int* __restrict__ anchor_dev = ptrs->anchor_dev;
+    const bf16* __restrict__ pred = ptrs->pred;
+    const bf16* __restrict__ succ = ptrs->succ;
+    int* __restrict__ drafts = ptrs->drafts;
+    int* __restrict__ n_drafts = ptrs->n_drafts;
     __shared__ SelShared sh;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    if (tid == 0) sh.predecessor = *a.anchor_dev;
+    if (tid == 0) sh.predecessor = *anchor_dev;
 #pragma unroll 1
-    for (int step = 0; step < a.steps; ++step) {
+    for (int step = 0; step < steps; ++step) {
         // prefetch the candidate's successor row (256 bf16 = 512 B, 32 x 16 B per warp)
         {
-            int token = lane == 0 ? a.ids[step * kTopK + warp] : 0;
+            int token = lane == 0 ? ids[step * kTopK + warp] : 0;
             token = __shfl_sync(0xffffffffu, token, 0);
-            const bf16* src = a.succ + static_cast<int64_t>(token) * a.R + lane * 8;
-#pragma unroll
-            for (int c8 = 0; c8 < a.R / 8; ++c8)
-                *reinterpret_cast<uint4*>(&sh.succ[warp][lane * 8 + c8 * 8]) =
-                    *reinterpret_cast<const uint4*>(src + c8 * 8);
+            const bf16* src = succ + static_cast<int64_t>(token) * R + lane * 8;
+            // one 16 B chunk per lane: 32 lanes x 8 elems = R (256). A loop over c8 with the
+            // index lane*8 + c8*8 would write 32 x 256 elems per row (OOB into the next row,
+            // 32-way race) - the row is exactly one chunk per lane.
+            *reinterpret_cast<uint4*>(&sh.succ[warp][lane * 8]) = *reinterpret_cast<const uint4*>(src);
         }
         __syncthreads();
-        if (tid < a.R)
+        if (tid < R)
             sh.product[tid] =
-                __bfloat162float(a.pred[static_cast<int64_t>(sh.predecessor) * a.R + tid]) *
-                __bfloat162float(a.hidden[step * a.R + tid]);
+                __bfloat162float(pred[static_cast<int64_t>(sh.predecessor) * R + tid]) *
+                __bfloat162float(hidden[step * R + tid]);
         __syncthreads();
         {
             float sum = 0.0f;
 #pragma unroll 4
-            for (int r = lane; r < a.R; r += 32) sum = fmaf(sh.product[r], __bfloat162float(sh.succ[warp][r]), sum);
+            for (int r = lane; r < R; r += 32) sum = fmaf(sh.product[r], __bfloat162float(sh.succ[warp][r]), sum);
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-            if (lane == 0) sh.edge[warp] = a.unary[step * kTopK + warp] + sum;
+            if (lane == 0) sh.edge[warp] = unary[step * kTopK + warp] + sum;
         }
         __syncthreads();
         if (warp == 0) {
-            const float e = lane < kTopK ? sh.edge[lane] : -kNegInf;
+            const float e = lane < kTopK ? sh.edge[lane] : kNegInf;   // the dead lanes sort last
             float m = e;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -739,20 +787,27 @@ __global__ void __launch_bounds__(512, 1) selector_walk_kernel(SelArgs a) {
             const unsigned winners = __ballot_sync(0xffffffffu, lane < kTopK && e == m);
             const int sel = winners == 0 ? 0 : __ffs(winners) - 1;
             if (lane == 0) {
-                sh.predecessor = a.ids[step * kTopK + sel];
-                a.drafts[step] = sh.predecessor;
+                sh.predecessor = ids[step * kTopK + sel];
+                drafts[step] = sh.predecessor;
             }
         }
         __syncthreads();
     }
-    if (tid == 0) *a.n_drafts = a.steps;
+    if (tid == 0) *n_drafts = steps;
 }
 
 void selector_walk(const int* ids, const float* unary, const bf16* hidden, const int* anchor_dev,
                           const bf16* pred, const bf16* succ, int* drafts, int* n_drafts, int steps, int R,
-                          cudaStream_t s) {
-    SelArgs a{ids, unary, hidden, anchor_dev, pred, succ, drafts, n_drafts, steps, R};
-    selector_walk_kernel<<<1, 512, 0, s>>>(a);
+                          cudaStream_t s, void* ptrs_dev) {
+    selector_walk_kernel<<<1, 512, 0, s>>>((const SelPtrs*) ptrs_dev, steps, R);
+}
+
+/// The synchronous slot write (the default stream; called once before the graph capture).
+void sel_write_slot(void* slot, const int* ids, const float* unary, const bf16* hidden, const int* anchor_dev,
+                    const bf16* pred, const bf16* succ, int* drafts, int* n_drafts) {
+    SelPtrs p{ids, unary, hidden, anchor_dev, pred, succ, drafts, n_drafts};
+    if (cudaMemcpy(slot, &p, sizeof p, cudaMemcpyHostToDevice) != cudaSuccess)
+        std::abort();
 }
 
 // ================================ the context store ================================

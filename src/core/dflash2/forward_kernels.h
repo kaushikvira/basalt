@@ -38,17 +38,27 @@ void pack_tail(const bf16* residual, const float* w, bf16* hidden, int K, int W,
 void f32_to_bf16(const float* in, bf16* out, int64_t n, cudaStream_t s);
 
 /// The symmetric sliding-window attention (the block's columns over the local cyclic K/V + the block's K/V).
+/// The pointers cross in the 64 B device slot `ptrs_dev`, not the kernel params: the driver (615.71.09)
+/// corrupts any kernel whose parameter buffer exceeds 64 B.  The slot is written once before the graph
+/// capture (`swa_write_slot`); the pointers are fixed for the drafter's lifetime.
 void swa(const bf16* q, const bf16* kb, const bf16* vb, const int* pos, const bf16* kc, const bf16* vc, int W,
-         int NHq, int NHk, int D, int window, const int* frontier_dev, float scale, bf16* out, cudaStream_t s);
+         int NHq, int NHk, int D, int window, const int* frontier_dev, float scale, bf16* out, cudaStream_t s,
+         void* ptrs_dev);
+void swa_write_slot(void* slot, const bf16* q, const bf16* kb, const bf16* vb, const bf16* kc, const bf16* vc,
+                    const int* pos, const int* frontier_dev, bf16* out);
 
 /// The top-k's local pass: the V/1024 chunks' top-16 (ids, scores), [chunks, N, 16] each.
 void topk_local(const bf16* logits, int V, int N, int* part_ids, float* part_scores, cudaStream_t s);
 /// One top-k merge level: in [C, N, 16] -> out [ceil(C/2), N, 16].
 void topk_merge(const int* in_i, const float* in_s, int C, int N, int* out_i, float* out_s, cudaStream_t s);
 
-/// The greedy candidate-path walk: the drafts [K] + the count (device, the graph writes it).
+/// The greedy candidate-path walk: the drafts [K] + the count (device, the graph writes it).  The pointers
+/// cross in the 64 B device slot `ptrs_dev` (written once before the capture via `sel_write_slot`), not the
+/// kernel params.
 void selector_walk(const int* ids, const float* unary, const bf16* hidden, const int* anchor_dev, const bf16* pred,
-                   const bf16* succ, int* drafts, int* n_drafts, int steps, int R, cudaStream_t s);
+                   const bf16* succ, int* drafts, int* n_drafts, int steps, int R, cudaStream_t s, void* ptrs_dev);
+void sel_write_slot(void* slot, const int* ids, const float* unary, const bf16* hidden, const int* anchor_dev,
+                    const bf16* pred, const bf16* succ, int* drafts, int* n_drafts);
 
 /// The appended K/V into the cyclic slots (slot (pos0 + i) % window).
 void ctx_store(const bf16* k, const bf16* v, int64_t pos0, int n, int window, int KV, bf16* kc, bf16* vc,

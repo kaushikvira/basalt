@@ -101,14 +101,22 @@ def main():
     # ---- context append
     ctx = bf16(features)
     ctx = mf.gemm(t("fc.weight"), ctx)
+    np.save(out / "ctx_fc_raw.npy", ctx)
     ctx = mf.rmsnorm(ctx, t("hidden_norm.weight"), eps)
+    np.save(out / "ctx_norm.npy", ctx)
     kc, vc = {}, {}
     pos = np.arange(n_ctx, dtype=np.int64)
     for l in range(geom["n_layers"]):
         k = mf.gemm(t(f"layers.{l}.self_attn.k_proj.weight"), ctx).reshape(n_ctx, nhk, d_)
+        if l == 0:
+            np.save(out / "ctx_k_gemm0.npy", k.reshape(n_ctx, nhk * d_))
         k = mf.per_head_rmsnorm(k, t(f"layers.{l}.self_attn.k_norm.weight"), eps)
+        if l == 0:
+            np.save(out / "ctx_k_norm0.npy", k.reshape(n_ctx, nhk * d_))
         k = mf.rope(k, pos, theta)
         v = mf.gemm(t(f"layers.{l}.self_attn.v_proj.weight"), ctx)
+        if l == 0:
+            np.save(out / "ctx_v_gemm0.npy", v)
         kc[l] = k.reshape(n_ctx, nhk * d_)
         vc[l] = v
     for l in range(geom["n_layers"]):

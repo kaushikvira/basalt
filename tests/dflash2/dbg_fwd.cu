@@ -166,12 +166,17 @@ int main(int argc, char** argv) {
         if (cudaMalloc(&ctx_pos, n_ctx * 4) != cudaSuccess) die("ctx_pos");
         cudaMemcpy(ctx_pos, pos_h, n_ctx * 4, cudaMemcpyHostToDevice);
         fk::gemm_bf16_wide((const fk::bf16*) W.feature_projection.dev, (const fk::bf16*) ctx_x, (fk::bf16*) ctx, H, ntap * H, n_ctx, 0);
+        save_bf16_as_f32(out + "/ctx_fc_raw.bin", ctx, (size_t) n_ctx * H);
         fk::rmsnorm((const fk::bf16*) ctx, (const float*) W.context_norm.dev, (fk::bf16*) ctx, n_ctx, H, g.rms_norm_eps, 0);
+        save_bf16_as_f32(out + "/ctx_norm.bin", ctx, (size_t) n_ctx * H);
         for (int l = 0; l < g.n_layers; ++l) {
             const DFlash2LayerW& L = W.layers[l];
             fk::gemm_bf16_wide((const fk::bf16*) L.k.dev, (const fk::bf16*) ctx, (fk::bf16*) ctx_k, KV, H, n_ctx, 0);
+            if (l == 0) save_bf16_as_f32(out + "/ctx_k_gemm0.bin", ctx_k, (size_t) n_ctx * KV);
             fk::rmsnorm_rope(nullptr, (fk::bf16*) ctx_k, ctx_pos, n_ctx, 0, g.num_key_value_heads, nullptr, (const float*) L.k_norm.dev, g.rope_theta, g.rms_norm_eps, 0);
+            if (l == 0) save_bf16_as_f32(out + "/ctx_k_norm0.bin", ctx_k, (size_t) n_ctx * KV);
             fk::gemm_bf16_wide((const fk::bf16*) L.v.dev, (const fk::bf16*) ctx, (fk::bf16*) ctx_v, KV, H, n_ctx, 0);
+            if (l == 0) save_bf16_as_f32(out + "/ctx_v_gemm0.bin", ctx_v, (size_t) n_ctx * KV);
             fk::ctx_store((const fk::bf16*) ctx_k, (const fk::bf16*) ctx_v, 0, n_ctx, g.sliding_window, KV, (fk::bf16*) kvk[l], (fk::bf16*) kvv[l], 0);
             save_bf16_as_f32(out + "/ctx_k_" + std::to_string(l) + ".bin", ctx_k, (size_t) n_ctx * KV);
             save_bf16_as_f32(out + "/ctx_v_" + std::to_string(l) + ".bin", ctx_v, (size_t) n_ctx * KV);
@@ -182,6 +187,8 @@ int main(int argc, char** argv) {
 
     // ---- block (eager)
     {
+        void* ptrs_dev = nullptr;
+        cudaMalloc(&ptrs_dev, 64);
         int ids_h[8], pos_h[8];
         ids_h[0] = anchor;
         for (int i = 1; i < Ws; ++i) ids_h[i] = g.mask_token_id;
@@ -220,7 +227,8 @@ int main(int argc, char** argv) {
                 save_bf16_as_f32(out + "/l0_k.bin", k, (size_t) Ws * KV);
                 save_bf16_as_f32(out + "/l0_v.bin", v, (size_t) Ws * KV);
             }
-            fk::swa((fk::bf16*) q, (fk::bf16*) k, (fk::bf16*) v, pos_dev, (const fk::bf16*) kvk[l], (const fk::bf16*) kvv[l], Ws, g.num_attention_heads, g.num_key_value_heads, g.head_dim, g.sliding_window, frontier_dev, scale, (fk::bf16*) attn, 0);
+            fk::swa_write_slot(ptrs_dev, (fk::bf16*) q, (fk::bf16*) k, (fk::bf16*) v, (const fk::bf16*) kvk[l], (const fk::bf16*) kvv[l], pos_dev, frontier_dev, (fk::bf16*) attn);
+            fk::swa((fk::bf16*) q, (fk::bf16*) k, (fk::bf16*) v, pos_dev, (const fk::bf16*) kvk[l], (const fk::bf16*) kvv[l], Ws, g.num_attention_heads, g.num_key_value_heads, g.head_dim, g.sliding_window, frontier_dev, scale, (fk::bf16*) attn, 0, ptrs_dev);
             if (l == 0) save_bf16_as_f32(out + "/l0_attn.bin", attn, (size_t) Ws * Q);
             fk::gemm_bf16((const fk::bf16*) L.o_proj.dev, (fk::bf16*) attn, (fk::bf16*) mlp, H, Q, Ws, 0);
             if (l == 0) save_bf16_as_f32(out + "/l0_o_raw.bin", mlp, (size_t) Ws * H);

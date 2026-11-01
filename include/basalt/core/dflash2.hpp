@@ -220,6 +220,7 @@ private:
         int* cand_ids; float* cand_scores; ///< the selector's [K, 16]
         int* tk_ids[2]; float* tk_s[2];    ///< the top-k's partials (ping-pong)
         int *pos, *ids, *frontier, *drafts_dev, *ctx_pos;
+        void* ptrs;                        ///< the 6 x 64 B pointer slots (swa/walk cross their pointers here)
     } wk_{};
 };
 
