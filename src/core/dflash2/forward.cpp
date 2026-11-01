@@ -258,15 +258,17 @@ bool DFlash2Drafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32
         err = buf;
         return false;
     }
-    if (frontier_pos_ < p + a) {
+    if (frontier_pos_ < p + a + 1) {
         err = "dflash2: the local K/V lags the anchor (append_context first)";
         return false;
     }
-    // the block's ids: the anchor then the masks; the positions: the anchor's position forward
+    // the block's ids: the anchor then the masks; the positions: the anchor's position forward.  The anchor
+    // (tokens[a] = outv[a]) is the next round's first token, which the verify window places at position p+a+1
+    // (the new p); the masks (the drafts) follow at p+a+2.., which is where the next window verifies them.
     int ids_h[W], pos_h[W];
     ids_h[0] = tokens[a];
     for (int i = 1; i < W; ++i) ids_h[i] = g.mask_token_id;
-    const int64_t pa = p + a;
+    const int64_t pa = p + a + 1;
     // the NInfer masked block: the positions clamp at the last visible context column (a sequence
     // shorter than the block piles the tail columns on it)
     const int64_t last = frontier_pos_ - 1;

@@ -12,6 +12,7 @@
 namespace basalt::core {
 class ModelFile;
 class MtpDrafter;
+class DFlash2Drafter;
 class RemoteExperts;
 class RemoteExpertOpt;
 }  // namespace basalt::core
@@ -80,6 +81,8 @@ struct Context {
     basalt::core::MtpDrafter& mtp;
     const bool& mtp_on;
     const basalt::core::QsaState* const& mtp_kv;
+    basalt::core::DFlash2Drafter& dflash2;
+    const bool& dflash2_on;
     const int64_t& n_vocab;
     std::optional<basalt::program::grammar::PackVocab>& grammar_vocab;
     basalt::core::NativeHead& native_head;

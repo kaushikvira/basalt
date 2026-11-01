@@ -118,6 +118,21 @@ Flow Request::read_prompt() {
         runtime_.sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
     }
     at = read_from;
+    // The DFlash2 drafter's prompt-tail seeding: the prefill's hidden-state tap captures the prompt's tokens at the
+    // drafter's tapped layers; the last min(2048, n) are appended to the drafter's local K/V so its first draft sees
+    // the prompt's context.  Set before the read; the readback + append happen at the end of the function.
+    if (runtime_.dflash2_on) {
+        const size_t nt = runtime_.dflash2.geom().target_layer_ids.size();
+        const int64_t n_ids = (int64_t) ids.size();
+        if (cudaMalloc(&dflash2_pf_tap_, (size_t) n_ids * nt * (size_t) runtime_.g.n_embd * 4) != cudaSuccess) {
+            std::printf("ERR dflash2: the prefill tap buffer failed\n");
+            return Flow::error;
+        }
+        dflash2_pf_tap_n_ = n_ids;
+        std::vector<int64_t> tap_layers(runtime_.dflash2.geom().target_layer_ids.begin(),
+                                        runtime_.dflash2.geom().target_layer_ids.end());
+        runtime_.sp.set_dflash2_tap(tap_layers.data(), (int) nt, dflash2_pf_tap_);
+    }
     // the last window of the last windowed part carries the last prompt token too: the first generated
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
@@ -209,6 +224,24 @@ Flow Request::read_prompt() {
     prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
     std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
     std::fflush(stdout);
+    // The DFlash2 prompt-tail append: read back the last min(2048, n) tapped rows and seed the drafter's local K/V.
+    if (runtime_.dflash2_on && dflash2_pf_tap_) {
+        const size_t nt = runtime_.dflash2.geom().target_layer_ids.size();
+        const int64_t n_ids = dflash2_pf_tap_n_;
+        const int64_t tap_n = std::min<int64_t>(2048, n_ids);
+        std::vector<float> feats((size_t) tap_n * nt * (size_t) runtime_.g.n_embd);
+        if (cudaMemcpy(feats.data(), dflash2_pf_tap_ + (size_t) (n_ids - tap_n) * nt * (size_t) runtime_.g.n_embd,
+                       (size_t) tap_n * nt * (size_t) runtime_.g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::printf("ERR dflash2: the prefill tap readback failed\n");
+            return Flow::error;
+        }
+        if (!runtime_.dflash2.append_context(feats.data(), (int) tap_n, n_ids - tap_n, runtime_.err)) {
+            std::printf("ERR dflash2: %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        cudaFree(dflash2_pf_tap_);
+        dflash2_pf_tap_ = nullptr;
+    }
 
     return Flow::proceed;
 }

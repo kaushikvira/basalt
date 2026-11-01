@@ -248,33 +248,59 @@ struct q8_block {
     int8_t qs[32];
 };
 static_assert(sizeof(q8_block) == 34);
-__global__ void gemm_q8_kernel(const uint8_t* __restrict__ w, const bf16* __restrict__ x,
-                               bf16* __restrict__ c, int M, int K, int N) {
-    // C [N, M] = head [M, K] Q8_0 @ x [N, K].  One thread per (m, n): dequantize the Q8 row and
-    // dot it with the x row.  Simple and exact (the logits path; N is tiny).
+// C [N, M] = head [M, K] Q8_0 @ x [N, K].  N is tiny (the block's K, 7), M is huge (the vocab, 248k),
+// K = the hidden width (2560).  One block per weight row m: dequantize the Q8_0 row to f32 smem ONCE,
+// then compute all N dot products (the row's 2720 B are read once per m, not N times).  The old
+// one-thread-per-output kernel read the row N times (4.7 GB of traffic) at 32 threads/block and took
+// ~72 ms; this is ~1 ms.
+template<int NOUT, int NTHREADS, int KMAX>
+__global__ void __launch_bounds__(NTHREADS) gemm_q8_kernel(const uint8_t* __restrict__ w,
+                                                           const bf16* __restrict__ x,
+                                                           bf16* __restrict__ c, int M, int K) {
+    constexpr int NWARP = NTHREADS / 32;
     const int m = static_cast<int>(blockIdx.x);
-    const int n = static_cast<int>(blockIdx.y);
-    if (n >= N) return;
     const int kRowB = K / 32 * 34;
     const uint8_t* wrow = w + static_cast<int64_t>(m) * kRowB;
-    const bf16* xrow = x + static_cast<int64_t>(n) * K;
-    float acc = 0.0f;
-    for (int blk = 0; blk < K / 32; ++blk) {
+    __shared__ float sw[KMAX];
+    __shared__ float red[NWARP][NOUT];
+    for (int i = threadIdx.x; i < K; i += NTHREADS) {
+        const int blk = i >> 5, q = i & 31;
         const uint8_t* src = wrow + blk * 34;
         const uint16_t sb = *reinterpret_cast<const uint16_t*>(src);
         const float d = __half2float(*reinterpret_cast<const __half*>(&sb));
-        const int8_t* qs = reinterpret_cast<const int8_t*>(src + 2);
-#pragma unroll
-        for (int q = 0; q < 32; ++q)
-            acc += d * static_cast<float>(qs[q]) * __bfloat162float(xrow[blk * 32 + q]);
+        sw[i] = d * static_cast<float>(reinterpret_cast<const int8_t*>(src + 2)[q]);
     }
-    c[static_cast<int64_t>(n) * M + m] = __float2bfloat16_rn(acc);
+    __syncthreads();
+    float acc[NOUT] = {};
+    for (int i = threadIdx.x; i < K; i += NTHREADS) {
+        const float wv = sw[i];
+#pragma unroll
+        for (int n = 0; n < NOUT; ++n)
+            acc[n] = fmaf(wv, __bfloat162float(x[(size_t) n * K + i]), acc[n]);
+    }
+#pragma unroll
+    for (int n = 0; n < NOUT; ++n) {
+        float v = acc[n];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5][n] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+#pragma unroll
+        for (int n = 0; n < NOUT; ++n) {
+            float v = (threadIdx.x < NWARP) ? red[threadIdx.x][n] : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (threadIdx.x == 0) c[(size_t) n * M + m] = __float2bfloat16_rn(v);
+        }
+    }
 }
 
 /// C [N, M] = head [M, K] Q8_0 @ x [N, K], N <= 16.
 void gemm_q8(const uint8_t* w, const bf16* x, bf16* c, int M, int K, int N, cudaStream_t s) {
-    const dim3 grid(M, N);
-    gemm_q8_kernel<<<grid, 32, 0, s>>>(w, x, c, M, K, N);
+    const dim3 grid(M);
+    gemm_q8_kernel<7, 256, 2560><<<grid, 256, 0, s>>>(w, x, c, M, K);
 }
 
 // ================================ the elementwise ops ================================

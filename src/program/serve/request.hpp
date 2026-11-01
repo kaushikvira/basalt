@@ -119,6 +119,10 @@ private:
     int64_t at{};
     int64_t fold_p0{};
     double prompt_ms{};
+    // the DFlash2 prefill tap (device, [n_ids, n_taps, n_embd] f32): set on the prefill at the start of
+    // read_prompt, the last min(2048, n) rows appended to the drafter's local K/V at the end.  Null when off.
+    float* dflash2_pf_tap_ = nullptr;
+    int64_t dflash2_pf_tap_n_ = 0;
     int64_t p{};
     int32_t x{};
     std::vector<int32_t> drafts{};

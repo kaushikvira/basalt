@@ -49,6 +49,7 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/mtp.hpp"
+#include "basalt/core/dflash2.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/native_dense.hpp"
@@ -217,6 +218,9 @@ private:
     int hist_dev{};
     basalt::core::Verifier ver{};
     basalt::core::VerifyHits vh{};
+    // the DFlash2 drafter's hidden-state tap buffer (device, [T, n_taps, n_embd] f32), allocated in init_verify
+    // when dflash2_on; the decode loop reads the committed rows from it.  Null when dflash2 is off.
+    float* dflash2_tap_buf_ = nullptr;
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
     basalt::core::Verifier ver_same{};
