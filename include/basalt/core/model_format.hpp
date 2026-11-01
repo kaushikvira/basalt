@@ -25,6 +25,8 @@
 //                            kTensorAlign within the section; meta.tensors[name].offset is relative to the section
 //   mtp/dense, mtp/dense.index, mtp/experts, mtp/draft_vocab
 //                            the drafter (the files of an mtp runtime directory)
+//   dflash2/dense, dflash2/dense.index
+//                            the DFlash2 block-diffusion drafter (dense pool + tensor index)
 //   profile                  the default expert profile
 //   hc8                      the 8-bit copies of the hyper-connection matrices, as `basalt --dump-hc8` writes them
 //   vision/mmproj            the vision projector GGUF, whole

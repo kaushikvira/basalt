@@ -216,6 +216,7 @@ def convert(a) -> None:
         dense = S.Dense(model, a.compat_bf16)
         experts = S.Experts(model)
         mtp = S.Mtp(a.mtp_source, a.mtp_dense) if a.mtp_source else None
+        dflash2 = S.DFlash2(a.dflash2_source) if a.dflash2_source else None
         n_vocab = len(kv.get("tokenizer.ggml.tokens") or []) or None
         draft_vocab = S.draft_vocab_bytes(a.draft_vocab, n_vocab) if a.draft_vocab else None
         if base is not None:
@@ -238,7 +239,7 @@ def convert(a) -> None:
         err = str(e)
     if err is not None:
         # Drop every view of the source files so they are unmapped (and deletable) before the process exits.
-        model = dense = experts = mtp = None
+        model = dense = experts = mtp = dflash2 = None
         gc.collect()
         die(err)
 
@@ -294,6 +295,9 @@ def convert(a) -> None:
                 job.chunks("mtp/experts", mtp.expert_chunks())
                 if draft_vocab is not None:
                     job.bytes("mtp/draft_vocab", draft_vocab)
+            if dflash2 is not None:
+                job.chunks("dflash2/dense", dflash2.dense_chunks())
+                job.bytes("dflash2/dense.index", dflash2.dense_index())
             if base is None:
                 job.bytes("profile", profile_blob)
             if a.hc8:
@@ -329,6 +333,7 @@ def convert(a) -> None:
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
+                "dflash2": dflash2.provenance() if dflash2 is not None else None,
                 "vision": base_meta.get("vision") if base is not None else None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
             }
@@ -349,7 +354,7 @@ def convert(a) -> None:
                 pass
             partial.unlink(missing_ok=True)
     if err is not None:
-        model = dense = experts = mtp = job = None
+        model = dense = experts = mtp = dflash2 = job = None
         gc.collect()
         die(err)
     os.replace(partial, out)
@@ -587,6 +592,7 @@ def main():
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
+    ap.add_argument("--dflash2-source", metavar="DIR", help="the DFlash2 drafter's safetensors + config.json directory")
     ap.add_argument("--mtp-dense", metavar="FILE", help="a tuned (self-distilled) mtp/dense section to embed (needs --mtp-source)")
     ap.add_argument("--draft-vocab", metavar="FILE", help="int32 token ids the draft head may propose (needs --mtp-source)")
     ap.add_argument("--profile", metavar="FILE", help="an expert profile to store as it is (--expert-profile-save's file)")
