@@ -71,7 +71,10 @@ void usage() {
                  "  --dump-taps FILE     write the target's 5-layer hidden-state taps + token ids to FILE\n"
                  "                       (the .taps raw binary format; needs --dflash2).  A pure read;\n"
                  "                       the output is bit-identical with or without the flag.  For the\n"
-                 "                       DFlash2 retrain's data collection (RETRAIN_PLAN.md §2.1)\n"
+                 "                       DFlash2 retrain's data collection (RETRAIN_PLAN.md §2.1).  The\n"
+                 "                       prompt's records come from the batched prompt path (the default;\n"
+                 "                       --prefill N sizes it) - on the token path the prompt is dumped by\n"
+                 "                       the decode windows instead\n"
 
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"

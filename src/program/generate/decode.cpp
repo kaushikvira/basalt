@@ -104,9 +104,10 @@ int decode(Context& context) {
             }
             std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
             ver.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf);
-            // Dump mode: open the TapDumper for the decode's per-round writes.
+            // Dump mode: open the TapDumper for the decode's per-round writes.  Append: the prefill's
+            // records (its chunks' taps) are already in the file - a fresh header would clobber them.
             if (!o.dump_taps.empty()) {
-                if (!tap_dumper.open(o.dump_taps, nt, g.n_embd, err)) {
+                if (!tap_dumper.open(o.dump_taps, nt, g.n_embd, err, true)) {
                     basalt::log::error("basalt generate", "%s", err.c_str());
                     return 1;
                 }
@@ -348,7 +349,8 @@ int decode(Context& context) {
             // The DFlash2 drafter (mutually exclusive with the MTP): the verify window's hidden-state tap holds the
             // accepted tokens' target hidden states; fill the drafter's local cyclic K/V with them, then draft the next
             // block.  The drafts go through the same verify window (drafter-agnostic), so the output is lossless.
-            if (use_dflash2 && (int64_t) produced.size() < o.max_new) {
+            // The last round skips the append + draft (nothing follows) but still dumps its record (the last token's).
+            if (use_dflash2 && ((int64_t) produced.size() < o.max_new || tap_dumper.open())) {
                 const cudaError_t sticky = cudaGetLastError();
                 if (sticky != cudaSuccess) {
                     basalt::log::error("basalt generate", "dflash2: sticky CUDA error before the tap readback: %s",
@@ -356,15 +358,18 @@ int decode(Context& context) {
                     return 1;
                 }
                 const size_t nt = dflash2.geom().target_layer_ids.size();
-                std::vector<float> dflash2_features((size_t) (a + 1) * nt * (size_t) g.n_embd);
+                const bool last_round = (int64_t) produced.size() >= o.max_new;
+                // The last round's window row a+1 (position p+a+1, the last committed token) is in the buffer
+                // too (a < T-1: the first rejected draft's row); include it so the dump covers every token.
+                const int dump_n = (last_round && a + 2 <= T) ? a + 2 : a + 1;
+                std::vector<float> dflash2_features((size_t) dump_n * nt * (size_t) g.n_embd);
                 const Clock::time_point tr0 = df2prof.on ? Clock::now() : Clock::time_point{};
-                // the tap's rows 0..a are the committed tokens (the anchor x at position p, then the accepted
-                // drafts d1..da at positions p+1..p+a); append them at [p, p+a+1) so the drafter's local K/V
-                // holds the committed sequence.  (The earlier readback skipped the anchor row and took the
-                // non-accepted d_{a+1} instead - an off-by-one that fed the drafter the wrong tokens.)
+                // the tap's rows 0..a are the window's committed tokens (the anchor x at position p, then the
+                // accepted drafts d1..da at positions p+1..p+a); append them at [p, p+a+1) so the drafter's
+                // local K/V holds the committed sequence.
                 if (cudaMemcpy(dflash2_features.data(),
                                dflash2_tap_buf,
-                               (size_t) (a + 1) * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                               (size_t) dump_n * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
                     char buf[256];
                     std::snprintf(buf, sizeof buf, "the DFlash2 tap readback failed: %s (a=%d spec=%d buf=%p rows=%d)" ,
                                   cudaGetErrorString(cudaGetLastError()), a, o.spec, (void*) dflash2_tap_buf, o.spec);
@@ -372,29 +377,34 @@ int decode(Context& context) {
                     return 1;
                 }
                 if (df2prof.on) df2prof.readback += std::chrono::duration<double, std::milli>(Clock::now() - tr0).count();
-                // Dump mode: write the committed tokens' taps + ids to the TapDumper.  A pure read;
-                // the decode's arithmetic is untouched.
+                // Dump mode: write the committed tokens paired with their OWN taps (the token at position t carries the
+                // tap at position t, the design's corpus-order pairing): the anchor x at position p, then the accepted
+                // drafts d1..da = outv[0..a-1] at positions p+1..p+a.  Every round writes, including the last.  A pure
+                // read; the decode's arithmetic is untouched.
                 if (tap_dumper.open()) {
-                    std::vector<int32_t> committed((size_t) (a + 1));
-                    for (int i = 0; i <= a; ++i) committed[(size_t) i] = outv[(size_t) i];
-                    tap_dumper.write_record_f32(committed.data(), dflash2_features.data(), a + 1);
+                    std::vector<int32_t> committed((size_t) dump_n);
+                    committed[(size_t) 0] = x;
+                    for (int i = 1; i < dump_n; ++i) committed[(size_t) i] = outv[(size_t) i - 1];
+                    tap_dumper.write_record_f32(committed.data(), dflash2_features.data(), dump_n);
                 }
-                const Clock::time_point ta0 = df2prof.on ? Clock::now() : Clock::time_point{};
-                if (!dflash2.append_context(dflash2_features.data(), a + 1, p, err)) {
-                    basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
-                    return 1;
-                }
-                if (df2prof.on) df2prof.append += std::chrono::duration<double, std::milli>(Clock::now() - ta0).count();
-                const Clock::time_point td0 = df2prof.on ? Clock::now() : Clock::time_point{};
-                // the next window's width is at most the spec's (the suffix lookup widens it past S_mtp); the graph
-                // always drafts the block's K, the window takes what it verifies
-                if (!dflash2.draft(std::min(o.spec, dflash2.draft_width()), outv.data(), p, a, drafts.data(), err, dprob.data())) {
-                    basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
-                    return 1;
-                }
-                if (df2prof.on) {
-                    df2prof.draft += std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
-                    ++df2prof.n;
+                if (!last_round) {
+                    const Clock::time_point ta0 = df2prof.on ? Clock::now() : Clock::time_point{};
+                    if (!dflash2.append_context(dflash2_features.data(), a + 1, p, err)) {
+                        basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                        return 1;
+                    }
+                    if (df2prof.on) df2prof.append += std::chrono::duration<double, std::milli>(Clock::now() - ta0).count();
+                    const Clock::time_point td0 = df2prof.on ? Clock::now() : Clock::time_point{};
+                    // the next window's width is at most the spec's (the suffix lookup widens it past S_mtp); the graph
+                    // always drafts the block's K, the window takes what it verifies
+                    if (!dflash2.draft(std::min(o.spec, dflash2.draft_width()), outv.data(), p, a, drafts.data(), err, dprob.data())) {
+                        basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                        return 1;
+                    }
+                    if (df2prof.on) {
+                        df2prof.draft += std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
+                        ++df2prof.n;
+                    }
                 }
             }
             if (adapt_thr.joinable()) adapt_thr.join();

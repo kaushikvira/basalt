@@ -30,12 +30,35 @@ namespace basalt::core {
 class TapDumper {
 public:
     /// Opens the file for writing.  `n_taps` and `n_embd` are written to the header.
-    /// Returns false with `err` set when the file cannot be opened.
-    bool open(const std::string& path, int n_taps, int n_embd, std::string& err) {
+    /// `append` (the decode's call, after the prefill's wrote its records): the file must already exist
+    /// with a valid v1 header and the same `n_taps`/`n_embd`; the records are appended after it, no new
+    /// header (a fresh header would clobber the prefill's records).  A missing file is created with a
+    /// fresh header (the decode alone, when the prompt path wrote none).  Returns false with `err` set
+    /// when the file cannot be opened (or the existing header is invalid).
+    bool open(const std::string& path, int n_taps, int n_embd, std::string& err, bool append = false) {
         n_taps_ = n_taps;
         n_embd_ = n_embd;
-        f_ = std::fopen(path.c_str(), "wb");
-        if (!f_) {
+        if (append) {
+            char magic[4] = {0, 0, 0, 0};
+            uint32_t hdr[5] = {0, 0, 0, 0, 0};
+            if (FILE* e = std::fopen(path.c_str(), "rb")) {
+                const bool ok = std::fread(magic, 1, 4, e) == 4 && std::fread(hdr, 4, 5, e) == 5;
+                std::fclose(e);
+                if (!ok || std::memcmp(magic, "TAPS", 4) != 0 || hdr[0] != 1 || (int) hdr[1] != n_taps ||
+                    (int) hdr[2] != n_embd) {
+                    err = "tap dumper: " + path + " has no valid v1 header (n_taps=" + std::to_string(n_taps) +
+                          ", n_embd=" + std::to_string(n_embd) + "); refusing to append";
+                    return false;
+                }
+                if (!(f_ = std::fopen(path.c_str(), "ab"))) {
+                    err = "tap dumper: cannot open " + path + " for appending";
+                    return false;
+                }
+                return true;
+            }
+            // no file yet: create it with a fresh header (fall through)
+        }
+        if (!(f_ = std::fopen(path.c_str(), "wb"))) {
             err = "tap dumper: cannot open " + path;
             return false;
         }

@@ -148,11 +148,14 @@ int prefill(Context& context) {
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             return fatal_start_error(err);
         }
-        // the prompt's tail (the drafter's sliding window) into the DFlash2 drafter's local cyclic K/V.
-        // In dump mode the on_chunk callback already read back every chunk; the tail append_context is
-        // skipped (spec=0 means no drafting, the drafter's local K/V is unused).
-        if (dflash2_on && dflash2_tap_buf != nullptr && o.dump_taps.empty()) {
+        // the prompt's tail (the drafter's sliding window) into the DFlash2 drafter's local cyclic K/V: the
+        // decode loop drafts against it.  The tap buffer is rolling (run.cpp rewrites it per chunk), so after
+        // the last chunk it holds only the last chunk's rows: the seed is at most the last chunk's length.
+        if (dflash2_on && dflash2_tap_buf != nullptr) {
+            const int64_t last_chunk =
+                std::min(o.prefill_chunk, n_batched - (n_batched / o.prefill_chunk) * o.prefill_chunk);
             dflash2_tap_n = std::min((int64_t) dflash2.geom().sliding_window, n_batched);
+            if (!o.dump_taps.empty()) dflash2_tap_n = std::min(dflash2_tap_n, last_chunk);   // the dump buffer is one chunk
             const size_t nt = dflash2.geom().target_layer_ids.size();
             std::vector<float> dflash2_features((size_t) dflash2_tap_n * nt * (size_t) g.n_embd);
             if (cudaMemcpy(dflash2_features.data(), dflash2_tap_buf, (size_t) dflash2_tap_n * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
