@@ -28,6 +28,17 @@ int run(int argc, char** argv) {
         // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
         o.native_shards = {o.model};
         if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
+        // --dflash2: the block-diffusion drafter, when the flag is on and the pack has its section.  It is mutually
+        // exclusive with the MTP drafter: the DFlash2's greedy drafts go through the same verify window, so the MTP
+        // is turned off when the DFlash2 is on (the two drafter K/Vs would otherwise both sit in VRAM).
+        if (o.dflash2 && !srcs.dflash2_dense.empty() && !srcs.dflash2_dense_index.empty()) {
+            o.dflash2_src = o.model;
+            o.mtp.clear();
+        }
+        if (o.dflash2 && o.dflash2_src.empty()) {
+            basalt::log::error("basalt generate", "--dflash2: the pack has no dflash2/dense section");
+            return 2;
+        }
         if (!srcs.profile.empty()) o.expert_profile = o.model + "#profile";
         // the 8-bit hyper-connection copies, unless this run is making them
         if (!srcs.hc8.empty() && o.dump_hc8.empty()) {

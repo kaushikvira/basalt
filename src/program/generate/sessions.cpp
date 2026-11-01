@@ -367,6 +367,19 @@ int sessions(Context& context) {
     basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
     const bool mtp_on = !o.mtp.empty();
     const basalt::core::QsaState* const mtp_kv = mtp_on ? &mtp.kv_state() : nullptr;   // the draft layer's K/V, if any
+    // The DFlash2 block-diffusion drafter: loaded like the MTP (host-side load, device-side bind later).  It keeps its
+    // own local cyclic K/V (one sliding window per layer) and the target's embedding + head (bound in decode).  It is
+    // mutually exclusive with the MTP (configure.cpp clears o.mtp when --dflash2 is on).
+    basalt::core::DFlash2Drafter dflash2;
+    if (!o.dflash2_src.empty()) {
+        if (o.spec < 2) o.dflash2_src.clear();   // no speculation: no drafter
+        if (!o.dflash2_src.empty() &&
+            !dflash2.load(basalt::core::DFlash2Files::from(srcs), model_file.meta(), err)) {
+            basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+    }
+    const bool dflash2_on = !o.dflash2_src.empty();
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  Loaded first, the cache is sized around the native
     // head, and the head is not refused after the expert arena has registered tens of GiB of host pages, like the
@@ -443,6 +456,8 @@ int sessions(Context& context) {
     context.mtp = &mtp;
     context.mtp_on = &mtp_on;
     context.mtp_kv = &mtp_kv;
+    context.dflash2 = &dflash2;
+    context.dflash2_on = &dflash2_on;
     context.n_vocab = &n_vocab;
     context.grammar_vocab = &grammar_vocab;
     context.native_head = &native_head;

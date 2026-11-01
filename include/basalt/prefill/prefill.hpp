@@ -170,6 +170,13 @@ public:
     /// with the GPU.  Not called under a layer split.
     std::function<void(int64_t layers_done, int64_t n_layers, int64_t T, int64_t pos0)> on_layer;
 
+    /// The DFlash2 drafter's hidden-state tap: after each tapped layer of a chunk, the prefill records the
+    /// hyper-connection mix (the target's hidden state, n_embd wide) for the chunk's rows into `features` (device,
+    /// [T, n_taps, n_embd] f32, token-major).  A pure read; the prefill's arithmetic is untouched.  Set before `run`.
+    void set_dflash2_tap(const int64_t* layers, int n_taps, float* features) {
+        tap_layers_ = layers; tap_n_taps_ = n_taps; tap_features_ = features;
+    }
+
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
     /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a
@@ -223,6 +230,13 @@ private:
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool rows_in_place_ = false;        ///< the next run's rows are in this stage's own buffers (continue_in_place)
     bool keep_last_ = false;            ///< set_keep_last
+    // the DFlash2 drafter's hidden-state tap: the tapped layer ids, their count, and the [T, n_taps, n_embd] f32
+    // buffer (device).  After each tapped layer of a chunk the prefill records the hyper-connection mix (the target's
+    // hidden state) for the chunk's rows into the buffer.  A pure read; the prefill's arithmetic is untouched.  Null
+    // layers disable it (the default).
+    const int64_t* tap_layers_ = nullptr;
+    int tap_n_taps_ = 0;
+    float* tap_features_ = nullptr;
 
     std::string next_err_;
     std::future<bool> next_run_;

@@ -75,6 +75,10 @@ struct Prefill::Run::Chunk {
     bool ple_layer(int64_t l);
     bool start_stream();
     bool layer(int64_t l);
+    /// The DFlash2 drafter's hidden-state tap: after layer `l`'s FFN write, record the hyper-connection mix (the
+    /// target's hidden state) for the chunk's T rows into the tap's features buffer at the tapped-layer slot `i`.
+    /// A pure read; the prefill's arithmetic is untouched.  No-op when the tap is off.
+    void tap(int64_t l, int i);
     bool gdn(const core::LayerView& v);
     bool qsa(const core::LayerView& v);
     bool moe(int64_t l, const core::LayerView& v);

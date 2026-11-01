@@ -73,6 +73,8 @@ struct Context {
     basalt::core::MtpDrafter* mtp = nullptr;
     const bool* mtp_on = nullptr;
     const basalt::core::QsaState *const* mtp_kv = nullptr;
+    basalt::core::DFlash2Drafter* dflash2 = nullptr;
+    const bool* dflash2_on = nullptr;
     const int64_t* n_vocab = nullptr;
     std::optional<basalt::program::grammar::PackVocab>* grammar_vocab = nullptr;
     basalt::core::NativeHead* native_head = nullptr;

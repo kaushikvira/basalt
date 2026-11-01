@@ -14,6 +14,7 @@ int decode(Context& context) {
     auto& ple_table = *context.ple_table;
     auto& d_parts = *context.d_parts;
     auto& mtp = *context.mtp;
+    auto& dflash2 = *context.dflash2;
     auto& n_vocab = *context.n_vocab;
     auto& native_head = *context.native_head;
     auto& d_logits = *context.d_logits;
@@ -81,6 +82,24 @@ int decode(Context& context) {
         const bool use_mtp = !o.mtp.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             return fatal_start_error(err);
+        }
+        // The DFlash2 block-diffusion drafter: bound like the MTP (the target's embedding + head).  Its hidden-state
+        // tap is configured on the verify window: after each tapped layer the window records the hyper-connection mix
+        // (the target's hidden state) for its rows into the tap's buffer, which the decode loop feeds to append_context.
+        const bool use_dflash2 = !o.dflash2_src.empty();
+        float* dflash2_tap_buf = nullptr;
+        if (use_dflash2) {
+            // the drafter is bound in the prefill (its bind allocates the device pool and is not idempotent); here only
+            // the verify window's hidden-state tap is configured: after each tapped layer the window records the
+            // hyper-connection mix (the target's hidden state) for its rows, which the loop feeds to append_context.
+            const auto& dg = dflash2.geom();
+            const int nt = (int) dg.target_layer_ids.size();
+            if (cudaMalloc(&dflash2_tap_buf, (size_t) o.spec * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+                basalt::log::error("basalt generate", "the DFlash2 tap buffer failed");
+                return 1;
+            }
+            std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
+            ver.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf);
         }
         ver.set_sampling(sp);   // the CLI's own sampling; no penalties here
         if (use_mtp) mtp.begin_request(o.tokens.data(), (int64_t) o.tokens.size());
@@ -202,6 +221,10 @@ int decode(Context& context) {
             basalt::log::error("basalt", "mtp: capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
+        if (use_dflash2 && !dflash2.prewarm(err)) {
+            basalt::log::error("basalt", "dflash2: capturing the draft graph failed: %s", err.c_str());
+            return 1;
+        }
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         basalt::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
@@ -220,6 +243,8 @@ int decode(Context& context) {
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
             }
             if (first_window) T = 1;
+            // the DFlash2 block is 8 tokens (anchor + 7 drafts); the window cannot exceed it (the drafter's K = 7)
+            if (use_dflash2) T = std::min(T, 8);
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -295,6 +320,26 @@ int decode(Context& context) {
             if (use_mtp) mtp.set_cum_th(cum_adapt.th());
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
+            // The DFlash2 drafter (mutually exclusive with the MTP): the verify window's hidden-state tap holds the
+            // accepted tokens' target hidden states; fill the drafter's local cyclic K/V with them, then draft the next
+            // block.  The drafts go through the same verify window (drafter-agnostic), so the output is lossless.
+            if (use_dflash2 && (int64_t) produced.size() < o.max_new) {
+                const size_t nt = dflash2.geom().target_layer_ids.size();
+                std::vector<float> dflash2_features((size_t) (a + 1) * nt * (size_t) g.n_embd);
+                if (cudaMemcpy(dflash2_features.data(), dflash2_tap_buf,
+                               (size_t) (a + 1) * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    basalt::log::error("basalt generate", "the DFlash2 tap readback failed");
+                    return 1;
+                }
+                if (!dflash2.append_context(dflash2_features.data(), a + 1, p, err)) {
+                    basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                    return 1;
+                }
+                if (!dflash2.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data())) {
+                    basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                    return 1;
+                }
+            }
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -313,6 +358,7 @@ int decode(Context& context) {
         if (!ver.wait_commit(err)) {
             return fatal_start_error(err);
         }
+        if (dflash2_tap_buf != nullptr) cudaFree(dflash2_tap_buf);
         cli::print_speculation({
             .o = o, .g = g, .drive = drive,
             .pool = pool, .src = src, .srcp = srcp,

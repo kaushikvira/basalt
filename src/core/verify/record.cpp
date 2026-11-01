@@ -39,6 +39,13 @@ bool Verifier::WindowRecorder::run() {
     if (!pre(v_.lb_)) return false;
     for (int64_t l = v_.lb_; l < v_.le_; ++l) {
         if (!post(l)) return false;
+        // the DFlash2 drafter's hidden-state tap: after the layer's FFN write, the residual is the layer's output;
+        // record its hyper-connection mix (the target's hidden state) for the window's rows, when this is a tapped
+        // layer.  A pure read; the window's arithmetic is untouched.
+        if (v_.tap_layers_ != nullptr) {
+            for (int i = 0; i < v_.tap_n_taps_; ++i)
+                if (v_.tap_layers_[(size_t) i] == l) { tap(l, i); break; }
+        }
         if (l + 1 < v_.le_ && !pre(l + 1)) return false;
     }
     if (lz_open) cudaStreamWaitEvent(cs, v_.lz_join_, 0);
@@ -51,6 +58,28 @@ bool Verifier::WindowRecorder::run() {
         return true;
     }
     return head();
+}
+
+// The DFlash2 drafter's hidden-state tap: after layer `l`'s FFN write, the residual is the layer's output.  Record its
+// hyper-connection mix (n_embd wide, the target's hidden state) for the window's T rows into the tap's features buffer
+// at the tapped-layer slot `i`.  A pure read of the residual (gr_read over the output_hc_* weights); the window's
+// arithmetic is untouched.  The mix is written straight into the strided features buffer ([T, n_taps, n_embd],
+// token-major), so no copy is needed.
+void Verifier::WindowRecorder::tap(int64_t l, int i) {
+    (void) l;
+    if (v_.tap_layers_ == nullptr || v_.tap_n_taps_ == 0 || v_.tap_features_ == nullptr) return;
+    const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
+                    *hu = wt.find("output_hc_up.weight");
+    if (!hn || !hd || !hu) return;
+    BlockBuffers bb = ss.block;
+    for (int t = 0; t < T; ++t) {
+        bb.R = Rt(t);
+        bb.mixed = v_.tap_features_ + (size_t) t * (size_t) v_.tap_n_taps_ * N + (size_t) i * N;
+        bb.inject = v_.tap_inj_;
+        basalt::kernels::gr_read(bb.R, (const float*) hn->data, (const uint16_t*) hd->data,
+                                 (const uint16_t*) hu->data, nullptr, EPS, gs, bb.gr,
+                                 bb.mixed, bb.inject, cs);
+    }
 }
 
 }  // namespace basalt::core

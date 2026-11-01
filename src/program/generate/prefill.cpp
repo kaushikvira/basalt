@@ -11,6 +11,8 @@ int prefill(Context& context) {
     auto& ss = *context.ss;
     auto& main_cs = *context.main_cs;
     auto& mtp = *context.mtp;
+    auto& dflash2 = *context.dflash2;
+    auto& dflash2_on = *context.dflash2_on;
     auto& native_head = *context.native_head;
     auto& srcp = *context.srcp;
     auto& xcache = *context.xcache;
@@ -90,8 +92,44 @@ int prefill(Context& context) {
             };
         }
         const Clock::time_point tp0 = Clock::now();
+        // The DFlash2 drafter's hidden-state tap: the prefill records the hyper-connection mix (the target's hidden
+        // state) at the tapped layers for the prompt's tail (the drafter's sliding window).  The drafter is bound here
+        // (before the prompt), so its local cyclic K/V can be filled from the tail's features; the decode loop does not
+        // re-bind it (its bind is not idempotent - it allocates the device pool).
+        float* dflash2_tap_buf = nullptr;
+        int64_t dflash2_tap_n = 0;
+        if (dflash2_on) {
+            if (!dflash2.bind(wt, &native_head, nullptr, err)) {
+                return fatal_start_error(err);
+            }
+            if (n_batched > 0) {
+                const auto& dg = dflash2.geom();
+                const int nt = (int) dg.target_layer_ids.size();
+                if (cudaMalloc(&dflash2_tap_buf, (size_t) 4096 * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+                    basalt::log::error("basalt generate", "the DFlash2 prefill tap buffer failed");
+                    return 1;
+                }
+                std::vector<int64_t> dflash2_tap_layers(dg.target_layer_ids.begin(), dg.target_layer_ids.end());
+                prefill.set_dflash2_tap(dflash2_tap_layers.data(), nt, dflash2_tap_buf);
+            }
+        }
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             return fatal_start_error(err);
+        }
+        // the prompt's tail (the drafter's sliding window) into the DFlash2 drafter's local cyclic K/V
+        if (dflash2_on && dflash2_tap_buf != nullptr) {
+            dflash2_tap_n = std::min((int64_t) 4096, n_batched);
+            const size_t nt = dflash2.geom().target_layer_ids.size();
+            std::vector<float> dflash2_features((size_t) dflash2_tap_n * nt * (size_t) g.n_embd);
+            if (cudaMemcpy(dflash2_features.data(), dflash2_tap_buf, (size_t) dflash2_tap_n * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                basalt::log::error("basalt generate", "the DFlash2 tap readback failed");
+                return 1;
+            }
+            if (!dflash2.append_context(dflash2_features.data(), (int) dflash2_tap_n, n_batched - dflash2_tap_n, err)) {
+                basalt::log::error("basalt generate", "dflash2: %s", err.c_str());
+                return 1;
+            }
+            cudaFree(dflash2_tap_buf);
         }
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {

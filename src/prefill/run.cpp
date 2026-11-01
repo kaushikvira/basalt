@@ -86,8 +86,44 @@ bool Prefill::Run::Chunk::execute() {
     m.ahead_layer[0] = m.ahead_layer[1] = m.guess_layer = -1;
     for (int64_t l = LB; l < LE; ++l) {
         if (!layer(l)) return false;
+        // the DFlash2 drafter's hidden-state tap: after the layer's FFN write, the residual is the layer's output;
+        // record its hyper-connection mix (the target's hidden state) for the chunk's rows, when this is a tapped
+        // layer.  A pure read; the prefill's arithmetic is untouched.
+        if (owner.tap_layers_ != nullptr) {
+            for (int i = 0; i < owner.tap_n_taps_; ++i)
+                if (owner.tap_layers_[(size_t) i] == l) { tap(l, i); break; }
+        }
     }
     return true;
+}
+
+// The DFlash2 drafter's hidden-state tap: after layer `l`'s FFN write, the residual is the layer's output.  Record its
+// hyper-connection mix (n_embd wide, the target's hidden state) for the chunk's T rows into the tap's features buffer
+// at the tapped-layer slot `i`.  A pure read (gr_read over the output_hc_* weights); the prefill's arithmetic is
+// untouched.  The mix is written straight into the strided features buffer ([T, n_taps, n_embd], token-major).
+void Prefill::Run::Chunk::tap(int64_t l, int i) {
+    (void) l;
+    if (owner.tap_layers_ == nullptr || owner.tap_n_taps_ == 0 || owner.tap_features_ == nullptr) return;
+    const core::WeightRef* hn = m.wt->find("output_hc_norm.weight");
+    const core::WeightRef* hd = m.wt->find("output_hc_down.weight");
+    const core::WeightRef* hu = m.wt->find("output_hc_up.weight");
+    if (!hn || !hd || !hu) return;
+    const int64_t N = g.n_embd, HC = g.hc;
+    const basalt::kernels::GrShapes gs{N, HC, g.hc_lr};
+    // the drafter's local K/V is a sliding window (2048), and append_context takes at most 4096 rows: keep only the
+    // chunk's tail (the rows the window can still reach), at the buffer's start.  Earlier chunks' rows fall out of the
+    // window before the decode begins, so only the last chunk's tail survives.
+    const int64_t k = std::min(T, (int64_t) 4096);
+    const int64_t t0 = T - k;
+    core::BlockBuffers bb = ss.block;
+    bb.inject = m.inj;
+    for (int64_t t = t0; t < T; ++t) {
+        bb.R = m.R + (size_t) t * HC * N;
+        bb.mixed = owner.tap_features_ + (size_t) (t - t0) * (size_t) owner.tap_n_taps_ * N + (size_t) i * N;
+        basalt::kernels::gr_read(bb.R, (const float*) hn->data, (const uint16_t*) hd->data,
+                                 (const uint16_t*) hu->data, nullptr, 1e-6f, gs, bb.gr,
+                                 bb.mixed, bb.inject, m.cs);
+    }
 }
 
 }  // namespace basalt::prefill

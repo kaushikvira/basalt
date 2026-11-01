@@ -175,6 +175,13 @@ struct Options {
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    /// --dflash2: enable the DFlash2 block-diffusion drafter (when the pack has a dflash2 section).  It takes
+    /// precedence over the MTP drafter: the two are mutually exclusive, the DFlash2's greedy drafts go through the
+    /// same verify window.  Off by default.
+    bool dflash2 = false;
+    /// The DFlash2 drafter's files, when --dflash2 is on and the pack has the dflash2 section (the model path);
+    /// empty means no DFlash2 drafter.
+    std::string dflash2_src;
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
     /// CPU computes the rest (host-planned verify windows).  Set from the startup link probe.
     double pcie_frac = -1.0;

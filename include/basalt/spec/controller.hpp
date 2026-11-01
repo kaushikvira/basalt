@@ -36,7 +36,7 @@ struct CostModel {
     double step_ms(int k, bool mtp) const;
 };
 
-enum class Source { None, Lookup, Mtp };
+enum class Source { None, Lookup, Mtp, DFlash2 };
 
 struct Choice {
     Source source = Source::None;

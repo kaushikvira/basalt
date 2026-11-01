@@ -5,6 +5,7 @@ namespace basalt::program::generate {
 int weights(Context& context) {
     auto& o = *context.o;
     auto& srcs = *context.srcs;
+    auto& model_file = *context.model_file;
     auto& pack_files = *context.pack_files;
     auto& multi_gpu = *context.multi_gpu;
     auto& err = *context.err;
@@ -34,16 +35,23 @@ int weights(Context& context) {
         }
     }
     if (!multi_gpu) {
-        uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0;
+        uint64_t dense_bytes = 0, mtp_bytes = 0, dflash2_bytes = 0, head_bytes = 0;
         std::set<std::string> index_names;
         for_each_index_name(pack_files.index, [&](const std::string& n) { index_names.insert(n); });
+        basalt::core::DFlash2Geometry dflash2_geom;
+        std::string dflash2_err;
+        const bool dflash2_planned = !o.dflash2 ||
+            (basalt::core::DFlash2Geometry::from_meta(model_file.meta(), dflash2_geom, dflash2_err) &&
+             basalt::core::DFlash2Drafter::plan_bytes(basalt::core::DFlash2Files::from(srcs), dflash2_geom,
+                                                      dflash2_bytes, dflash2_err));
         const bool planned =
             basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, dense_bytes, err) &&
             basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err) &&
             (o.mtp.empty() || o.spec < 2 ||
-             basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
+             basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err)) &&
+            dflash2_planned;
         if (planned) {
-            cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + mtp_bytes +
+            cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + mtp_bytes + dflash2_bytes +
                                 basalt::core::Verifier::hc8_plan_bytes(
                                     [&](const std::string& n) { return index_names.count(n) > 0; }, g);
             model_bytes = cuda0_fixed_bytes + expert_total_bytes;

@@ -66,6 +66,7 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/mtp.hpp"
+#include "basalt/core/dflash2.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/native_dense.hpp"
