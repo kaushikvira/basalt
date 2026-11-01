@@ -65,10 +65,19 @@ bool DFlash2Geometry::from_meta(const Json& meta, DFlash2Geometry& out, std::str
             out.layer_types.push_back(x.s);
         }
     }
-    if (const Json* v = d->get("rms_norm_eps"))
-        if (v->is_number()) out.rms_norm_eps = (float) v->num();
-    if (const Json* v = d->get("rope_theta"))
-        if (v->is_number()) out.rope_theta = (float) v->num();
+    // S5 + S6: rms_norm_eps, rope_theta, sliding_window are required (a silent default is a silent
+    // acceptance collapse / an under-planned K/V arena)
+    {
+        const Json* v = d->get("rms_norm_eps");
+        if (v == nullptr || !v->is_number()) { err = "dflash2: meta is missing 'rms_norm_eps'"; return false; }
+        out.rms_norm_eps = (float) v->num();
+        const Json* r = d->get("rope_theta");
+        if (r == nullptr || !r->is_number()) { err = "dflash2: meta is missing 'rope_theta'"; return false; }
+        out.rope_theta = (float) r->num();
+        const Json* w = d->get("sliding_window");
+        if (w == nullptr || !w->is_number()) { err = "dflash2: meta is missing 'sliding_window'"; return false; }
+        out.sliding_window = (int) w->i64();
+    }
     return out.valid(err);
 }
 
@@ -115,43 +124,57 @@ bool DFlash2Drafter::load(const DFlash2Files& files, const Json& meta, std::stri
     // the internal layout, resolved by role
     w_ = DFlash2Weights{};
     w_.layers.resize((size_t) g_.n_layers);
+    resolved_count_ = 0;
     for (const DFlash2Tensor& t : tensors_) resolve(t);
+    // S3: every pool tensor must resolve to a role (an under-counted n_layers leaves dead bytes)
+    if (resolved_count_ != (int) tensors_.size()) {
+        err = "dflash2: " + std::to_string(tensors_.size() - resolved_count_) + " pool tensor(s) resolve to no role";
+        return false;
+    }
     // the shapes the kernels depend on, checked against the geometry (a mismatch is a load-time stop)
     const int64_t h = g_.hidden_size, d = g_.head_dim, q = g_.q_width(), kv = g_.kv_width();
     const int64_t inter = g_.intermediate_size, V = g_.vocab_size, rank = g_.selector_rank;
     const int64_t taps = (int64_t) g_.target_layer_ids.size();
     const int64_t conv_rows = 2 * (int64_t) g_.conv_kernel_size * (h / g_.conv_group_size);
     const int64_t conv_cols = (int64_t) g_.conv_kernel_size * h;
-    auto shape = [&](const DFlash2Tensor& t, const char* role, int64_t rows, int64_t cols) -> bool {
+    auto shape = [&](const DFlash2Tensor& t, const char* role, int64_t rows, int64_t cols, const char* kind) -> bool {
         if (t.name.empty()) { err = std::string("dflash2: ") + role + " is missing from the index"; return false; }
         if (t.rows != rows || t.cols != cols) {
             err = std::string("dflash2: ") + role + " is " + std::to_string(t.rows) + "x" + std::to_string(t.cols) +
                   ", the geometry wants " + std::to_string(rows) + "x" + std::to_string(cols);
             return false;
         }
+        // S4: the kind + bytes must match (a misdeclared count is a silent F32-read-of-BF16 / a half-matrix GEMM)
+        const uint64_t esz = (std::string(kind) == "f32") ? 4u : 2u;
+        if (t.kind != kind || t.bytes != (uint64_t) rows * (uint64_t) cols * esz) {
+            err = std::string("dflash2: ") + role + " kind/bytes inconsistent (" + t.kind + " " +
+                  std::to_string(t.bytes) + " B; wants " + kind + " " +
+                  std::to_string((uint64_t) rows * (uint64_t) cols * esz) + " B)";
+            return false;
+        }
         return true;
     };
-    if (!shape(w_.feature_projection, "feature_projection", h, taps * h) ||
-        !shape(w_.context_norm, "context_norm", 1, h) ||
-        !shape(w_.final_norm, "final_norm", 1, h) ||
-        !shape(w_.sel_hidden, "candidate_selector.hidden_projection", rank, h) ||
-        !shape(w_.sel_pred, "candidate_selector.predecessor_codebook", V, rank) ||
-        !shape(w_.sel_succ, "candidate_selector.successor_codebook", V, rank)) {
+    if (!shape(w_.feature_projection, "feature_projection", h, taps * h, "bf16") ||
+        !shape(w_.context_norm, "context_norm", 1, h, "f32") ||
+        !shape(w_.final_norm, "final_norm", 1, h, "f32") ||
+        !shape(w_.sel_hidden, "candidate_selector.hidden_projection", rank, h, "bf16") ||
+        !shape(w_.sel_pred, "candidate_selector.predecessor_codebook", V, rank, "bf16") ||
+        !shape(w_.sel_succ, "candidate_selector.successor_codebook", V, rank, "bf16")) {
         return false;
     }
     for (int i = 0; i < g_.n_layers; ++i) {
         const DFlash2LayerW& L = w_.layers[(size_t) i];
         const char* pf = "layer ";
         (void) pf;
-        if (!shape(L.q, "q_proj", q, h) || !shape(L.k, "k_proj", kv, h) || !shape(L.v, "v_proj", kv, h) ||
-            !shape(L.o_proj, "o_proj", h, q) || !shape(L.q_norm, "q_norm", 1, d) || !shape(L.k_norm, "k_norm", 1, d) ||
-            !shape(L.input_norm, "input_norm", 1, h) || !shape(L.post_attention_norm, "post_attention_norm", 1, h) ||
-            !shape(L.gate, "gate_proj", inter, h) || !shape(L.up, "up_proj", inter, h) ||
-            !shape(L.down, "down_proj", h, inter) ||
-            !shape(L.attn_conv_base, "attention_conv.base_kernel", 2, conv_cols) ||
-            !shape(L.attn_conv_kernel, "attention_conv.kernel_projection", conv_rows, h) ||
-            !shape(L.mlp_conv_base, "mlp_conv.base_kernel", 2, conv_cols) ||
-            !shape(L.mlp_conv_kernel, "mlp_conv.kernel_projection", conv_rows, h)) {
+        if (!shape(L.q, "q_proj", q, h, "bf16") || !shape(L.k, "k_proj", kv, h, "bf16") || !shape(L.v, "v_proj", kv, h, "bf16") ||
+            !shape(L.o_proj, "o_proj", h, q, "bf16") || !shape(L.q_norm, "q_norm", 1, d, "f32") || !shape(L.k_norm, "k_norm", 1, d, "f32") ||
+            !shape(L.input_norm, "input_norm", 1, h, "f32") || !shape(L.post_attention_norm, "post_attention_norm", 1, h, "f32") ||
+            !shape(L.gate, "gate_proj", inter, h, "bf16") || !shape(L.up, "up_proj", inter, h, "bf16") ||
+            !shape(L.down, "down_proj", h, inter, "bf16") ||
+            !shape(L.attn_conv_base, "attention_conv.base_kernel", 2, conv_cols, "bf16") ||
+            !shape(L.attn_conv_kernel, "attention_conv.kernel_projection", conv_rows, h, "bf16") ||
+            !shape(L.mlp_conv_base, "mlp_conv.base_kernel", 2, conv_cols, "bf16") ||
+            !shape(L.mlp_conv_kernel, "mlp_conv.kernel_projection", conv_rows, h, "bf16")) {
             return false;
         }
     }
@@ -160,7 +183,7 @@ bool DFlash2Drafter::load(const DFlash2Files& files, const Json& meta, std::stri
 
 void DFlash2Drafter::resolve(const DFlash2Tensor& t) {
     const std::string& n = t.name;
-    auto set = [&](DFlash2Tensor& slot) { slot = t; };
+    auto set = [&](DFlash2Tensor& slot) { slot = t; ++resolved_count_; };
     if (n == "fc.weight") { set(w_.feature_projection); return; }
     if (n == "hidden_norm.weight") { set(w_.context_norm); return; }
     if (n == "norm.weight") { set(w_.final_norm); return; }
@@ -230,8 +253,10 @@ bool DFlash2Drafter::plan_bytes(const DFlash2Files& files, const DFlash2Geometry
 
 // ================================ the bind ================================
 
-bool DFlash2Drafter::bind(SessionState& ss, std::string& err) {
-    (void) ss;   // the forward sub-task backs the K/V from the session's KvArena; the stub owns its own
+bool DFlash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
+    (void) window_R;   // the drafter does not use the window's residuals (MTP does); kept for signature parity
+    wt_ = &wt;         // S2: the target's weight table (the forward uses its embedding)
+    head_ = head;      // S2: the target's output head (the forward scores the drafts with it)
     if (tensors_.empty()) { err = "dflash2: bind before load"; return false; }
     cudaGetDevice(&device_);
     kv_cells_ = g_.sliding_window;

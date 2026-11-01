@@ -24,6 +24,8 @@
 namespace basalt::core {
 
 struct SessionState;
+class WeightTable;
+class NativeHead;
 
 /// The DFlash2 drafter's geometry, read from `meta["dflash2"]` (the converter's `provenance()`): the
 /// `dflash_config` block (block_size, conv_*, selector_*, target_layer_ids, mask_token_id) plus the head /
@@ -129,8 +131,10 @@ public:
     static bool plan_bytes(const DFlash2Files& files, const DFlash2Geometry& g, uint64_t& out, std::string& err);
 
     /// Device-side: allocate the dense pool and the K/V arena, copy the pool in, zero the K/V, and set the
-    /// internal layout's device pointers.  After `load`.
-    bool bind(SessionState& ss, std::string& err);
+    /// internal layout's device pointers.  Takes the target's embedding + head (the drafter reuses them, per
+    /// NInfer's bind_draft).  After `load`.  (The allocation happens here, not in `load` — a reordered
+    /// lifecycle vs MTP.)
+    bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
     /// One draft round: the block-diffusion forward.  STUB - returns an empty block (the forward + kernels are
     /// the next sub-task).  Mirrors MtpDrafter::draft's signature so the decode-loop integration is a drop-in.
@@ -143,7 +147,10 @@ public:
 
     /// An event behind everything queued on the drafter's stream so far (a verify window on this card waits for
     /// it).  Null before `bind`.
-    cudaEvent_t done_event() { return ev_done_; }
+    cudaEvent_t done_event() {
+        if (cs_ && ev_done_) cudaEventRecord(ev_done_, cs_);
+        return ev_done_;
+    }
 
     uint64_t vram_bytes() const { return vram_; }
     int device() const { return device_; }
@@ -163,6 +170,9 @@ private:
     DFlash2Files files_;
     DFlash2Weights w_;
     std::vector<DFlash2Tensor> tensors_;   ///< the index, in pool order
+    int resolved_count_ = 0;               ///< S3: the tensors resolve() claimed (== tensors_.size() after load)
+    const WeightTable* wt_ = nullptr;      ///< S2: the target's weight table (embedding + head)
+    const NativeHead* head_ = nullptr;     ///< S2: the target's output head
     uint64_t vram_ = 0;
     int device_ = -1;
     cudaStream_t cs_ = nullptr;

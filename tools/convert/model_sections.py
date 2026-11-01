@@ -595,6 +595,7 @@ class DFlash2:
             "rms_norm_eps": self.config.get("rms_norm_eps"),
             "rope_theta": self.config.get("rope_parameters", {}).get("rope_theta", self.config.get("rope_theta")),
             "layer_types": self.config.get("layer_types"),
+            "sliding_window": self.config.get("sliding_window"),
         }
 
 
