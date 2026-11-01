@@ -334,7 +334,7 @@ def convert(a) -> None:
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
-                "dflash2": dflash2.provenance() if dflash2 is not None else None,
+                "dflash2": base_meta.get("dflash2") if base is not None else (dflash2.provenance() if dflash2 is not None else None),
                 "vision": base_meta.get("vision") if base is not None else None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
             }
@@ -471,7 +471,7 @@ def from_checkpoint(a) -> None:
                     "scale": ple.scale}]},
                 "sampling": SAMPLING, "license": model_license(kv),
             }
-            for k in ("profile", "hc8", "mtp", "vision"):
+            for k in ("profile", "hc8", "mtp", "vision", "dflash2"):
                 meta[k] = base_meta.get(k)
             if tuned_sha:
                 meta["mtp"] = {**meta["mtp"], "dense": {"tuning": "self_distilled", "sha256": tuned_sha}}

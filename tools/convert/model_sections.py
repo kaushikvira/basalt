@@ -544,8 +544,8 @@ class DFlash2:
             shape = t["shape"]
             raw = self._tensor_bytes(name)
             # guard (S1): the source must be BF16/F16 and the byte count must match 2*prod(shape)
-            if t["dtype"] not in ("BF16", "F16"):
-                raise ConvertError(f"dflash2: {name} dtype {t['dtype']} (expected BF16/F16)")
+            if t["dtype"] != "BF16":
+                raise ConvertError(f"dflash2: {name} dtype {t['dtype']} (expected BF16)")
             if len(raw) != 2 * int(np.prod(shape)):
                 raise ConvertError(f"dflash2: {name} bytes {len(raw)} != 2*prod(shape)={2 * int(np.prod(shape))}")
             if len(shape) == 1:
@@ -593,7 +593,7 @@ class DFlash2:
             "vocab_size": self.config.get("vocab_size"),
             "max_position_embeddings": self.config.get("max_position_embeddings"),
             "rms_norm_eps": self.config.get("rms_norm_eps"),
-            "rope_theta": self.config.get("rope_theta"),
+            "rope_theta": self.config.get("rope_parameters", {}).get("rope_theta", self.config.get("rope_theta")),
             "layer_types": self.config.get("layer_types"),
         }
 
