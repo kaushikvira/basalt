@@ -112,8 +112,9 @@ void Prefill::Run::Chunk::tap(int64_t l, int i) {
     const basalt::kernels::GrShapes gs{N, HC, g.hc_lr};
     // the drafter's local K/V is a sliding window (2048), and append_context takes at most 4096 rows: keep only the
     // chunk's tail (the rows the window can still reach), at the buffer's start.  Earlier chunks' rows fall out of the
-    // window before the decode begins, so only the last chunk's tail survives.
-    const int64_t k = std::min(T, (int64_t) 4096);
+    // window before the decode begins, so only the last chunk's tail survives.  Capped at 2048 (the sliding window)
+    // so the readback in prefill.cpp is always within the buffer's row count.
+    const int64_t k = std::min(T, (int64_t) 2048);
     const int64_t t0 = T - k;
     core::BlockBuffers bb = ss.block;
     bb.inject = m.inj;

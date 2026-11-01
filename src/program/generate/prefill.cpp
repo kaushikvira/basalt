@@ -105,7 +105,7 @@ int prefill(Context& context) {
             if (n_batched > 0) {
                 const auto& dg = dflash2.geom();
                 const int nt = (int) dg.target_layer_ids.size();
-                if (cudaMalloc(&dflash2_tap_buf, (size_t) 4096 * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
+                if (cudaMalloc(&dflash2_tap_buf, (size_t) 2048 * (size_t) nt * (size_t) g.n_embd * 4) != cudaSuccess) {
                     basalt::log::error("basalt generate", "the DFlash2 prefill tap buffer failed");
                     return 1;
                 }
@@ -118,7 +118,7 @@ int prefill(Context& context) {
         }
         // the prompt's tail (the drafter's sliding window) into the DFlash2 drafter's local cyclic K/V
         if (dflash2_on && dflash2_tap_buf != nullptr) {
-            dflash2_tap_n = std::min((int64_t) 4096, n_batched);
+            dflash2_tap_n = std::min((int64_t) 2048, n_batched);
             const size_t nt = dflash2.geom().target_layer_ids.size();
             std::vector<float> dflash2_features((size_t) dflash2_tap_n * nt * (size_t) g.n_embd);
             if (cudaMemcpy(dflash2_features.data(), dflash2_tap_buf, (size_t) dflash2_tap_n * nt * (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
