@@ -324,6 +324,7 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/mtp/draft.cpp
   src/core/mtp/stores.cpp
   src/core/mtp/batching.cpp
+  src/core/dflash2/loader.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
