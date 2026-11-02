@@ -49,10 +49,16 @@ int resident_load(Context& context) {
                 "cannot determine the available RAM (no MemAvailable in /proc/meminfo, or a malformed cgroup memory "
                 "limit or memory.stat), which the resident RAM mode (--resident-experts) sizes its copy of the "
                 "experts from");
+        // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep
+        // none, so the places follow their share of the cache (re-defined here; resident_plan.cpp holds the twin)
+        auto spare_places = [&](int64_t full) -> int64_t {
+            if (lend_from < 0 || xcache.slots() <= 0) return full;
+            return (full * lend_from + xcache.slots() - 1) / xcache.slots();
+        };
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
-                                            : o.adapt_swaps * kSatBoost);
+                                            : spare_places(o.adapt_swaps * kSatBoost));
         uint64_t resident_headroom = resident_headroom_base;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
@@ -104,12 +110,14 @@ int resident_load(Context& context) {
             else
                 err = whole_err + "; " + err;
         }
+        if (resident_ok && lend_from >= 0 && src.resident_lent_slots() > 0)
+            *context.copies_from = std::max<int64_t>(lend_from, xcache.slots() - src.resident_lent_slots());
         if (resident_ok && o.prefill_auto_fit && lend_from >= 0) {
             // A lent slot whose expert the complement holds is refilled from RAM; the others are read from the file.
             // Allow the backed slots plus a fixed amount of file reading per prompt.  Those reads are evictable page
             // cache that the refill passes through once, so two chunks' worth are funded; the read-time cap
             // (kMaxAutoChunk) bounds the chunk, so the ceiling stops there too.
-            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - kv_tail_slots) +
+            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - (*context.kv_tail_copies ? kv_tail_slots : 0)) +
                                   (int64_t) (2 * basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
             auto_ceiling = std::max<int64_t>(8192, engine_local::biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
                                                                  [&](int64_t t) { return serve_loans::lend_slots(xcache, g, ss, t) <= allow; }));

@@ -187,10 +187,23 @@ int resident_plan(Context& context) {
             else stage_lent_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
         }
     }
-    // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    if (kv_tail_slots > 0)
+    // The RAM copies cover the prompt path's lend region: the RAM decides how far down that goes.  The elastic KV
+    // moves that region down as it takes the cache's tail, and the experts it then reaches without a copy take a RAM
+    // home at the request's admission (home_given_up), given back when the cache grows again; so the copies do not
+    // also cover the region's lowest reach.  More than one slot (--batch) keeps them: its slots' prompts lend while
+    // others decode, and homes are taken only between requests.
+    const bool kv_tail_copies = o.batch > 0;
+    if (kv_tail_slots > 0 && kv_tail_copies)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep none,
+    // so the places follow their share of the cache
+    auto spare_places = [&](int64_t full) -> int64_t {
+        if (lend_from < 0 || xcache.slots() <= 0) return full;
+        return (full * lend_from + xcache.slots() - 1) / xcache.slots();
+    };
+    // the first slot whose expert the RAM copy really keeps: above lend_from when the RAM held fewer of the region's
+    // copies than planned (set once the complement is pinned)
+    int64_t copies_from = lend_from;
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
     // built here, with the picks.
@@ -220,7 +233,7 @@ int resident_plan(Context& context) {
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
         const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
-        const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
+        const uint64_t spares_full = adapt_fast_on ? (uint64_t) spare_places(o.adapt_swaps * kSatBoost) * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
         // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
@@ -307,6 +320,8 @@ int resident_plan(Context& context) {
     context.late = &late;
     context.resident_headroom_base = &resident_headroom_base;
     context.lend_from = &lend_from;
+    context.copies_from = &copies_from;
+    context.kv_tail_copies = &kv_tail_copies;
     context.stage_held = &stage_held;
     context.pool = &pool;
     context.peer_only = &peer_only;
