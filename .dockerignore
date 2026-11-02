@@ -1,0 +1,17 @@
+# Keep the build context minimal: only what the Dockerfile (gateway repo,
+# docker/basalt/Dockerfile) needs. Excluding these keeps the context transfer
+# small and the build-layer hash stable for doc/test/site changes.
+.git
+build/
+# tests/ is REQUIRED: CMakeLists adds parity targets from tests/ unconditionally
+# (not gated on BUILD_TESTING). data/ is bench fixtures only (test-time).
+site/
+assets/
+data/
+docs/
+*.md
+!README.md
+__pycache__/
+*.pyc
+.venv/
+basalt_config.json

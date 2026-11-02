@@ -36,6 +36,11 @@ int dispatch(Context& context) {
     auto& stage_of = context.stage_of;
     auto& profile_all = *context.profile_all;
     auto& kv_floor = *context.kv_floor;
+    auto& kv_host_on = *context.kv_host_on;
+    auto& kv_host_forced = *context.kv_host_forced;
+    auto& kv_tail_copies = *context.kv_tail_copies;
+    auto& copies_from = *context.copies_from;
+    auto& lend_from = *context.lend_from;
     auto& bslot_ss = *context.bslot_ss;
     auto& slot_cap = *context.slot_cap;
     auto& slot_kv_cuda0 = *context.slot_kv_cuda0;
@@ -161,6 +166,11 @@ int dispatch(Context& context) {
             .stage_of = stage_of,
             .profile_all = profile_all,
             .kv_floor = kv_floor,
+            .kv_host_on = kv_host_on,
+            .kv_host_forced = kv_host_forced,
+            .kv_tail_copies = kv_tail_copies,
+            .lend_from = lend_from,
+            .copies_from = copies_from,
             .bslot_ss = bslot_ss,
             .slot_cap = slot_cap,
             .slot0_is_solo = slot0_is_solo,
