@@ -5,16 +5,25 @@ Adapted from z-lab/dflash (open-source PyTorch reference). Trains the 5-layer
 DFlash2 drafter to predict the next 7 tokens given the target's 5-layer
 hidden-state taps + the anchor token. The target's embedding + head are frozen.
 
+v2 recipe (the go/no-go fine-tune):
+  - Partial masking: each sample sees k of the 7 real tokens at random
+    positions (k ~ Uniform(1..6)); CE loss is computed on the masked
+    positions only (the standard block-diffusion training objective — the
+    v1 full-mask recipe was not how the drafter was trained).
+  - LR schedule: 1e-4 peak, 100-step warmup, cosine decay to 1e-5.
+  - Shuffled training order (seeded).
+
 Usage:
     # Dry-run (CPU, small context, 3 steps):
     python retrain_dflash2.py --dry-run
 
     # Full training (GPU):
-    python retrain_dflash2.py --epochs 10 --batch-size 32 --lr 1e-5
+    python retrain_dflash2.py --epochs 3 --batch-size 32 --lr 1e-4
 """
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -228,16 +237,20 @@ class DFlash2Trainer(nn.Module):
         self.block_size = config.dflash_config["block_size"]  # 8
 
     def forward(self, context_taps: torch.Tensor, anchor_ids: torch.Tensor,
-                target_ids: torch.Tensor) -> torch.Tensor:
+                target_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute 7-position logits for a batch of samples.
 
         Args:
             context_taps: [B, W, 5, 2560] — per-sample context windows
             anchor_ids: [B] — per-sample last committed token id
-            target_ids: [B, 7] — target token ids (for loss; not used in forward)
+            target_ids: [B, 7] — target token ids (loss targets + the real
+                tokens shown at the unmasked block positions)
 
         Returns:
             logits: [B, 7, vocab_size]
+            loss_mask: [B, 7] bool — True where the block position is the
+                mask token (i.e. a loss target; the unmasked positions show
+                the real token to the model and are excluded from the loss)
 
         The drafter's forward is fully batch-compatible: fc + norm, the 5
         decoder layers (SDPA attention with a [1,1,q,k] causal mask, dynamic
@@ -251,10 +264,25 @@ class DFlash2Trainer(nn.Module):
         #    The drafter.forward() applies fc + hidden_norm internally.
         context_concat = context_taps.reshape(B, W, -1)  # [B, W, 12800]
 
-        # 2. Build the block embeddings: [B, 8] ids (anchor + 7 masks) → [B, 8, 2560]
+        # 2. Build the block embeddings: [B, 8] ids (anchor + partial mask).
+        #    Partial masking (the DFlash2 training objective): each sample
+        #    sees k of the 7 real tokens at random distinct positions,
+        #    k ~ Uniform(1..6). k=7 (all real) would leave no loss targets;
+        #    k=0 (all masked, the v1 recipe) is excluded — the model must
+        #    see at least one real token in the block. The remaining 7-k
+        #    positions stay the mask token and are the only loss targets.
+        n_draft = self.block_size - 1  # 7
+        k = torch.randint(1, n_draft, (B,), device=device)  # real tokens/sample
+        # argsort of uniform noise = a random permutation of 0..6 per row;
+        # the first k_i of row i are the unmasked (real-token) positions.
+        order = torch.rand(B, n_draft, device=device).argsort(dim=1)  # [B, 7]
+        is_real = torch.zeros(B, n_draft, dtype=torch.bool, device=device)
+        is_real.scatter_(1, order, torch.arange(n_draft, device=device)
+                         .unsqueeze(0) < k.unsqueeze(1))  # [B, 7]
         block_ids = torch.full((B, self.block_size), self.mask_token_id,
                                dtype=torch.long, device=device)
         block_ids[:, 0] = anchor_ids
+        block_ids[:, 1:] = torch.where(is_real, target_ids, block_ids[:, 1:])
         noise_embedding = F.embedding(block_ids, self.target_embed)  # [B, 8, 2560]
 
         # 3. Position ids for the full sequence (context + block).
@@ -278,7 +306,7 @@ class DFlash2Trainer(nn.Module):
         #    Both sides are BF16, so .to() is a no-op — no per-sample F32 copy.
         logits = F.linear(draft_hidden, self.target_head.to(draft_hidden.dtype))  # [B, 7, vocab]
 
-        return logits
+        return logits, ~is_real
 
 
 # ---------------------------------------------------------------------------
@@ -430,12 +458,15 @@ def train(args: argparse.Namespace) -> None:
         dataset = torch.utils.data.Subset(dataset, indices)
         print(f"  Dry-run: {len(dataset)} samples")
 
+    # Shuffled training order (seeded generator → reproducible across runs).
+    gen = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size if not args.dry_run else min(args.batch_size, len(dataset)),
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
         collate_fn=collate_fn,
+        generator=gen,
     )
 
     # --- Optimizer ---
@@ -454,12 +485,26 @@ def train(args: argparse.Namespace) -> None:
     ]
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
-    # --- Training loop ---
-    trainer.train()
-    step = 0
+    # --- LR schedule: warmup to peak, then cosine decay to 0.1× peak ---
+    # LambdaLR multiplies each group's base LR by lr_lambda(step), so the
+    # codebook group tracks the same shape at 0.1× (1e-5 → 1e-6 for the
+    # codebooks when the peak is 1e-4).
+    WARMUP_STEPS = 100
     total_steps = len(loader) * args.epochs
     if args.max_steps > 0:
         total_steps = min(total_steps, args.max_steps)
+
+    def lr_lambda(step: int) -> float:
+        if step < WARMUP_STEPS:
+            return step / WARMUP_STEPS
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # --- Training loop ---
+    trainer.train()
+    step = 0
     t0 = time.perf_counter()
 
     for epoch in range(args.epochs):
@@ -474,14 +519,17 @@ def train(args: argparse.Namespace) -> None:
             # batch-compatible (linears, SDPA, RoPE, dynamic conv all broadcast
             # over B), so all B samples run in a single pass — no per-sample
             # Python loop, no GPU idle time between launches.
-            logits = trainer(context_taps, anchor, target)  # [B, 7, vocab]
+            logits, loss_mask = trainer(context_taps, anchor, target)  # [B, 7, vocab], [B, 7]
 
-            # Cross-entropy loss in F32 (numerical stability: a log-softmax over
-            # a 248K vocab in BF16 loses too much precision). The forward stays
-            # BF16 end-to-end; only the logits are upcast for the loss.
+            # Cross-entropy on the MASKED positions only (the partial-masking
+            # objective): each sample contributes 7-k_i targets (k_i real
+            # tokens were shown to the model). In F32 for numerical stability
+            # (a log-softmax over a 248K vocab in BF16 loses too much
+            # precision); the forward stays BF16 end-to-end. Every sample has
+            # ≥1 masked position (k ≤ 6), so the masked set is never empty.
             loss = F.cross_entropy(
-                logits.float().reshape(-1, logits.shape[-1]),  # [B*7, vocab] f32
-                target.reshape(-1),                            # [B*7]
+                logits[loss_mask].float().reshape(-1, logits.shape[-1]),  # [n_masked, vocab]
+                target[loss_mask],                                        # [n_masked]
             )
 
             optimizer.zero_grad()
@@ -491,6 +539,7 @@ def train(args: argparse.Namespace) -> None:
                 torch.nn.utils.clip_grad_norm_(drafter.parameters(), args.grad_clip)
 
             optimizer.step()
+            scheduler.step()
             epoch_loss_t += loss.detach()
             epoch_steps += 1
             step += 1
@@ -501,8 +550,10 @@ def train(args: argparse.Namespace) -> None:
                 eta = (total_steps - step) / rate if rate > 0 else 0.0
                 gpu_gb = torch.cuda.memory_allocated(device) / 1e9 \
                     if device.type == "cuda" else 0.0
+                lr_now = optimizer.param_groups[0]["lr"]
                 print(f"  step {step}/{total_steps} | loss={loss.item():.4f} | "
-                      f"{1000.0 / rate:.0f} ms/step | ETA={eta / 60:.1f}min | GPU={gpu_gb:.1f}GB",
+                      f"lr={lr_now:.2e} | {1000.0 / rate:.0f} ms/step | "
+                      f"ETA={eta / 60:.1f}min | GPU={gpu_gb:.1f}GB",
                       flush=True)
 
             if args.max_steps > 0 and step >= args.max_steps:
@@ -565,12 +616,13 @@ def dry_run(checkpoint: str = str(Path(MODEL_SAFETENSORS).parent),
         dry_run=True,
         batch_size=2,
         epochs=1,
-        lr=1e-5,
+        lr=1e-4,
         weight_decay=0.01,
         grad_clip=1.0,
         window=64,
         log_every=1,
         max_steps=0,
+        seed=42,
         taps=str(TAPS_FILE),
         corpus="",
         checkpoint=checkpoint,
@@ -596,8 +648,9 @@ def main():
                         help="Torch device (default: cuda:0; set CUDA_VISIBLE_DEVICES for the physical GPU)")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-5,
-                        help="Learning rate (codebooks get 0.1× this)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Peak learning rate (codebooks get 0.1× this); 100-step "
+                             "warmup then cosine decay to 0.1× peak")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--window", type=int, default=2048,
@@ -610,6 +663,8 @@ def main():
                         help="Drafter checkpoint dir (model.safetensors + config.json)")
     parser.add_argument("--target-head", default=str(TARGET_EMBED_HEAD),
                         help="Frozen target embed+head safetensors")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Shuffle seed for the training DataLoader (default 42)")
     parser.add_argument("--log-every", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Stop after N steps (0 = run full epochs; for quick tests)")

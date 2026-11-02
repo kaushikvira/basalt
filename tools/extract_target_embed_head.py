@@ -2,10 +2,15 @@
 
 The training script (retrain_dflash2.py) needs the target's embedding table + head as a
 sidecar file. This script reads the .basalt pack, extracts:
-  - token_embd.weight: Q8_0 [n_embd, n_vocab] → dequantized to BF16, transposed to [n_vocab, n_embd]
-  - output.weight: Q8_0 [n_embd, n_vocab] → dequantized to BF16, transposed to [n_vocab, n_embd]
+  - token_embd.weight: Q8_0, bytes laid out as per-token rows [n_vocab, n_embd]
+  - output.weight: Q8_0, bytes laid out as per-token rows [n_vocab, n_embd]
 
-and saves both as a single safetensors file (BF16, [248320, 2560]).
+and saves both dequantized to a single safetensors file (BF16, [248320, 2560]).
+
+Note: the meta JSON declares the logical ggml shape [n_embd, n_vocab], but the byte
+layout is per-token rows (the engine's embedding_gather / NativeEmbed read
+`table + token * row_bytes`), so the flat dequantized array is reshaped to
+[n_vocab, n_embd] directly - no transpose.
 
 Usage:
     python3 tools/extract_target_embed_head.py \
@@ -135,16 +140,15 @@ def main():
             raise ValueError(f"{name} not found in the pack's meta")
         print(f"  {name}: type={tensors_meta[name]['type']} shape={tensors_meta[name]['shape']}", flush=True)
     
-    # The pack stores [n_embd, n_vocab]; we want [n_vocab, n_embd] = [248320, 2560]
+    # The pack's bytes are per-token rows: [n_vocab, n_embd] = [248320, 2560].
     # Both are Q8_0 in the NVFP4 pack.
-    
+
     # Read and dequantize the embedding
     print("\nExtracting embedding (Q8_0 → BF16) ...", flush=True)
     t0 = time.time()
     emb_meta = tensors_meta["token_embd.weight"]
     emb_f32 = read_tensor_q8_0(args.pack, gguf_off, emb_meta["offset"], emb_meta["bytes"])
-    emb_f32 = emb_f32.reshape(emb_meta["shape"])  # [n_embd, n_vocab]
-    emb_f32 = emb_f32.T  # → [n_vocab, n_embd]
+    emb_f32 = emb_f32.reshape(248320, 2560)  # per-token rows, as the engine reads them
     emb_bf16 = f32_to_bf16_uint16(emb_f32)
     del emb_f32
     print(f"  embedding: {emb_bf16.shape} ({emb_bf16.nbytes / 1e6:.0f} MB) in {time.time() - t0:.1f}s", flush=True)
@@ -154,8 +158,7 @@ def main():
     t0 = time.time()
     head_meta = tensors_meta["output.weight"]
     head_f32 = read_tensor_q8_0(args.pack, gguf_off, head_meta["offset"], head_meta["bytes"])
-    head_f32 = head_f32.reshape(head_meta["shape"])  # [n_embd, n_vocab]
-    head_f32 = head_f32.T  # → [n_vocab, n_embd]
+    head_f32 = head_f32.reshape(248320, 2560)  # per-token rows, as the engine reads them
     head_bf16 = f32_to_bf16_uint16(head_f32)
     del head_f32
     print(f"  head: {head_bf16.shape} ({head_bf16.nbytes / 1e6:.0f} MB) in {time.time() - t0:.1f}s", flush=True)
@@ -191,7 +194,6 @@ def main():
     print("\nSpot-check (first 4 values of each) ...", flush=True)
     # Re-read a small slice from the pack for comparison
     with open(out_path, "rb") as f:
-        f.read(8)  # header size
         hs = struct.unpack("<Q", f.read(8))[0]
         hjson = json.loads(f.read(hs).rstrip(b"\0"))
         # Read the first 8 BF16 values of embed.weight
